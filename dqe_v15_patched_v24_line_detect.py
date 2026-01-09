@@ -455,6 +455,8 @@ def default_blemish_params() -> Dict[str, Any]:
         "min_circularity": 0.0,
         "max_eccentricity": 1.0,
         "overlay_bottom_margin_px": 5,
+        "fixed_line_x": [],
+        "fixed_line_y": [],
 
     }
 
@@ -684,6 +686,32 @@ def _runs_from_sorted_indices(idxs: np.ndarray) -> List[Tuple[int, int]]:
     return out
 
 
+def _parse_fixed_line_list(value: Any) -> List[int]:
+    """고정 라인 좌표 입력(문자열/리스트)을 정수 리스트로 정규화합니다."""
+    if value is None:
+        return []
+    items: List[Any]
+    if isinstance(value, str):
+        items = [v.strip() for v in value.split(",") if v.strip()]
+    elif isinstance(value, (list, tuple, set, np.ndarray)):
+        items = list(value)
+    else:
+        return []
+
+    out: List[int] = []
+    for item in items:
+        try:
+            out.append(int(str(item).strip()))
+        except Exception:
+            continue
+    return sorted(set(out))
+
+
+def _format_fixed_line_list(value: Any) -> str:
+    vals = _parse_fixed_line_list(value)
+    return ",".join(str(v) for v in vals)
+
+
 def detect_low_value_lines_in_roi(
     img: np.ndarray,
     roi: Optional[RoiBounds],
@@ -692,7 +720,11 @@ def detect_low_value_lines_in_roi(
     dn_hi: float = 100.0,
     frac_threshold: float = 0.95,
     ignore_border_px: int = 8,
-) -> Tuple[List[int], List[int], List[Tuple[int, int]], List[Tuple[int, int]]]:
+    fixed_line_x: Optional[List[int]] = None,
+    fixed_line_y: Optional[List[int]] = None,
+    broken_line_min_low_frac: float = 0.80,
+    broken_line_min_normal_frac: float = 0.10,
+) -> Tuple[List[int], List[int], List[Tuple[int, int]], List[Tuple[int, int]], List[Tuple[int, int]]]:
     """ROI 내에서 '저DN(0~100)'이 거의 전체 길이로 유지되는 column/row 라인을 탐지합니다.
 
     반환:
@@ -700,16 +732,17 @@ def detect_low_value_lines_in_roi(
       bad_rows_y: 전체 이미지 좌표계의 y 인덱스 리스트
       col_runs: bad_cols_x를 연속 구간으로 묶은 (start_x, end_x) 리스트 (inclusive)
       row_runs: bad_rows_y를 연속 구간으로 묶은 (start_y, end_y) 리스트 (inclusive)
+      broken_points_xy: 끊긴 라인이 의심되는 지점의 (x, y) 좌표 리스트
 
     주의:
       - '꾸준히'의 해석은 (해당 축 방향 픽셀 중 dn_lo~dn_hi 비율 >= frac_threshold) 입니다.
       - ROI 가장자리의 0값(프레임/마진) 오탐을 줄이기 위해 ignore_border_px 만큼 ROI를 안쪽으로 줄입니다.
     """
     if img is None:
-        return [], [], [], []
+        return [], [], [], [], []
     try:
         if img.ndim != 2 or img.size == 0:
-            return [], [], [], []
+            return [], [], [], [], []
         H, W = int(img.shape[0]), int(img.shape[1])
 
         if roi is not None and getattr(roi, 'valid', False):
@@ -728,7 +761,7 @@ def detect_low_value_lines_in_roi(
             x1i, x2i, y1i, y2i = x1, x2, y1, y2
 
         if (x2i - x1i) < 2 or (y2i - y1i) < 2:
-            return [], [], [], []
+            return [], [], [], [], []
 
         view = img[y1i:y2i, x1i:x2i]
         # bool mask: DN in [dn_lo, dn_hi]
@@ -738,18 +771,54 @@ def detect_low_value_lines_in_roi(
         col_frac = mask.mean(axis=0)  # (roi_w,)
         row_frac = mask.mean(axis=1)  # (roi_h,)
 
+        fixed_x = set(_parse_fixed_line_list(fixed_line_x))
+        fixed_y = set(_parse_fixed_line_list(fixed_line_y))
+
         bad_cols_rel = np.where(col_frac >= float(frac_threshold))[0].astype(np.int64)
         bad_rows_rel = np.where(row_frac >= float(frac_threshold))[0].astype(np.int64)
 
-        bad_cols = (bad_cols_rel + int(x1i)).tolist()
-        bad_rows = (bad_rows_rel + int(y1i)).tolist()
+        if fixed_x:
+            bad_cols_rel = np.array([i for i in bad_cols_rel if (int(i) + int(x1i)) not in fixed_x], dtype=np.int64)
+        if fixed_y:
+            bad_rows_rel = np.array([i for i in bad_rows_rel if (int(i) + int(y1i)) not in fixed_y], dtype=np.int64)
 
-        col_runs = _runs_from_sorted_indices(bad_cols_rel + int(x1i))
-        row_runs = _runs_from_sorted_indices(bad_rows_rel + int(y1i))
+        bad_cols = (bad_cols_rel + int(x1i)).tolist() if bad_cols_rel.size else []
+        bad_rows = (bad_rows_rel + int(y1i)).tolist() if bad_rows_rel.size else []
 
-        return bad_cols, bad_rows, col_runs, row_runs
+        col_runs = _runs_from_sorted_indices(bad_cols_rel + int(x1i)) if bad_cols_rel.size else []
+        row_runs = _runs_from_sorted_indices(bad_rows_rel + int(y1i)) if bad_rows_rel.size else []
+
+        broken_points_xy: List[Tuple[int, int]] = []
+
+        if float(broken_line_min_low_frac) > 0 and float(broken_line_min_normal_frac) > 0:
+            low_min = float(broken_line_min_low_frac)
+            normal_min = float(broken_line_min_normal_frac)
+
+            for idx, low_frac in enumerate(col_frac):
+                x = int(x1i + idx)
+                if fixed_x and x in fixed_x:
+                    continue
+                normal_frac = 1.0 - float(low_frac)
+                if float(low_frac) >= low_min and normal_frac >= normal_min:
+                    normal_idx = np.where(~mask[:, idx])[0]
+                    if normal_idx.size > 0:
+                        y = int(y1i + normal_idx[int(normal_idx.size // 2)])
+                        broken_points_xy.append((x, y))
+
+            for idx, low_frac in enumerate(row_frac):
+                y = int(y1i + idx)
+                if fixed_y and y in fixed_y:
+                    continue
+                normal_frac = 1.0 - float(low_frac)
+                if float(low_frac) >= low_min and normal_frac >= normal_min:
+                    normal_idx = np.where(~mask[idx, :])[0]
+                    if normal_idx.size > 0:
+                        x = int(x1i + normal_idx[int(normal_idx.size // 2)])
+                        broken_points_xy.append((x, y))
+
+        return bad_cols, bad_rows, col_runs, row_runs, broken_points_xy
     except Exception:
-        return [], [], [], []
+        return [], [], [], [], []
 
 def apply_line_noise_correction(raw: np.ndarray, roi: Optional[RoiBounds]) -> np.ndarray:
     """
@@ -1095,6 +1164,11 @@ class BlemishParamDialog(QWidget):
         self.db_min_circ = QDoubleSpinBox(); self.db_min_circ.setRange(0, 1); self.db_min_circ.setDecimals(4); self.db_min_circ.setValue(float(self._params.get("min_circularity", 0.0)))
         self.db_max_ecc = QDoubleSpinBox(); self.db_max_ecc.setRange(0, 1); self.db_max_ecc.setDecimals(4); self.db_max_ecc.setValue(float(self._params.get("max_eccentricity", 1.0)))
 
+        self.le_fixed_line_x = QLineEdit(); self.le_fixed_line_x.setPlaceholderText("ex) 235,2304")
+        self.le_fixed_line_x.setText(_format_fixed_line_list(self._params.get("fixed_line_x", "")))
+        self.le_fixed_line_y = QLineEdit(); self.le_fixed_line_y.setPlaceholderText("ex) 1304,3043")
+        self.le_fixed_line_y.setText(_format_fixed_line_list(self._params.get("fixed_line_y", "")))
+
         # form rows
         form.addRow("Scope", self.cb_scope)
         form.addRow("", self.chk_use_ref)
@@ -1111,6 +1185,8 @@ class BlemishParamDialog(QWidget):
         form.addRow("Min DN", self.sp_min_dn)
         form.addRow("Min Circ", self.db_min_circ)
         form.addRow("Max Ecc", self.db_max_ecc)
+        form.addRow("Fixed Line X", self.le_fixed_line_x)
+        form.addRow("Fixed Line Y", self.le_fixed_line_y)
 
         btns = QHBoxLayout()
         layout.addLayout(btns)
@@ -1164,6 +1240,8 @@ class BlemishParamDialog(QWidget):
             "min_dn": int(self.sp_min_dn.value()),
             "min_circularity": float(self.db_min_circ.value()),
             "max_eccentricity": float(self.db_max_ecc.value()),
+            "fixed_line_x": _parse_fixed_line_list(self.le_fixed_line_x.text()),
+            "fixed_line_y": _parse_fixed_line_list(self.le_fixed_line_y.text()),
         }
         self.applied.emit(p)
 
@@ -2860,14 +2938,18 @@ class XrayNapariWidget(QSplitter):
             if self.raw_data is None:
                 return
             roi = self.roi_bounds if (self.roi_bounds is not None and getattr(self.roi_bounds, 'valid', False)) else None
+            fixed_x = _parse_fixed_line_list(self.blemish_params.get("fixed_line_x"))
+            fixed_y = _parse_fixed_line_list(self.blemish_params.get("fixed_line_y"))
 
-            bad_cols, bad_rows, col_runs, row_runs = detect_low_value_lines_in_roi(
+            bad_cols, bad_rows, col_runs, row_runs, broken_points = detect_low_value_lines_in_roi(
                 self.raw_data,
                 roi,
                 dn_lo=0.0,
                 dn_hi=100.0,
                 frac_threshold=0.95,
                 ignore_border_px=8,
+                fixed_line_x=fixed_x,
+                fixed_line_y=fixed_y,
             )
 
             total_lines = int(len(bad_cols) + len(bad_rows))
@@ -2877,6 +2959,10 @@ class XrayNapariWidget(QSplitter):
                     max_run = max(max_run, int(e) - int(s) + 1)
                 except Exception:
                     pass
+
+            if broken_points:
+                coord_text = ", ".join(f"({x},{y})" for x, y in broken_points)
+                show_info(self, "끊긴 라인 발견", f"끊긴 라인 발견! {coord_text}")
 
             # 3개 이상(집합/다발) 발견 시 강한 경고
             if total_lines >= 3 or max_run >= 3:
