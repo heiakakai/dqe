@@ -21,7 +21,7 @@
             }
         },
         "4343|Probe": {
-            "saved_at": "2026-01-09T17:43:33+09:00",
+            "saved_at": "2026-01-12T14:22:41+09:00",
             "params": {
                 "analysis_scope": "ROI",
                 "use_roi_as_reference": true,
@@ -39,12 +39,18 @@
                 "min_circularity": 0.55,
                 "max_eccentricity": 0.95,
                 "overlay_bottom_margin_px": 10,
+                "line_drop_ratio": 0.9,
+                "line_frac_threshold": 0.01,
+                "line_exclude_x": "",
+                "line_exclude_y": "",
+                "line_ignore_margin_px": 8,
+                "line_break_jump_ratio": 0.5,
                 "fixed_line_x": "1974",
                 "fixed_line_y": "1281,257"
             }
         },
         "3643|Probe": {
-            "saved_at": "2026-01-08T18:23:10+09:00",
+            "saved_at": "2026-01-12T14:21:38+09:00",
             "params": {
                 "analysis_scope": "ROI",
                 "use_roi_as_reference": true,
@@ -61,7 +67,13 @@
                 "min_dn": 1,
                 "min_circularity": 0.65,
                 "max_eccentricity": 0.8,
-                "overlay_bottom_margin_px": 10
+                "overlay_bottom_margin_px": 10,
+                "line_drop_ratio": 0.9,
+                "line_frac_threshold": 0.05,
+                "line_exclude_x": "",
+                "line_exclude_y": "",
+                "line_ignore_margin_px": 8,
+                "line_break_jump_ratio": 0.5
             }
         },
         "1616|Probe": {

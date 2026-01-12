@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import json
 import time
+import re
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -455,6 +456,12 @@ def default_blemish_params() -> Dict[str, Any]:
         "min_circularity": 0.0,
         "max_eccentricity": 1.0,
         "overlay_bottom_margin_px": 5,
+        "line_drop_ratio": 0.9,
+        "line_frac_threshold": 0.05,
+        "line_exclude_x": "",
+        "line_exclude_y": "",
+        "line_ignore_margin_px": 8,
+        "line_break_jump_ratio": 0.5,
 
     }
 
@@ -684,13 +691,58 @@ def _runs_from_sorted_indices(idxs: np.ndarray) -> List[Tuple[int, int]]:
     return out
 
 
+def _parse_line_exclude_list(text: Any) -> List[int]:
+    if not text:
+        return []
+    s = str(text)
+    parts = re.split(r"[,\s;]+", s)
+    out: List[int] = []
+    seen = set()
+    for t in parts:
+        if not t:
+            continue
+        m = re.search(r"(-?\d+)", t)
+        if m is None:
+            continue
+        try:
+            v = int(m.group(1))
+        except Exception:
+            continue
+        if v < 0:
+            continue
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return sorted(out)
+
+
+def _is_broken_line(profile_1d: np.ndarray, roi_mean: float, jump_ratio: float) -> bool:
+    try:
+        if profile_1d is None or profile_1d.size < 2:
+            return False
+        if not np.isfinite(roi_mean):
+            return False
+        jr = float(jump_ratio)
+    except Exception:
+        return False
+    if jr <= 0:
+        return False
+    thr = abs(float(roi_mean)) * jr
+    if not np.isfinite(thr) or thr <= 0:
+        return False
+    try:
+        diffs = np.abs(np.diff(profile_1d.astype(np.float64, copy=False)))
+        return bool(np.any(diffs >= thr))
+    except Exception:
+        return False
+
+
 def detect_low_value_lines_in_roi(
     img: np.ndarray,
     roi: Optional[RoiBounds],
     *,
-    dn_lo: float = 0.0,
-    dn_hi: float = 100.0,
-    frac_threshold: float = 0.95,
+    drop_ratio: float = 0.1,
+    frac_threshold: float = 0.1,
     ignore_border_px: int = 8,
 ) -> Tuple[List[int], List[int], List[Tuple[int, int]], List[Tuple[int, int]]]:
     """ROI 내에서 '저DN(0~100)'이 거의 전체 길이로 유지되는 column/row 라인을 탐지합니다.
@@ -731,15 +783,32 @@ def detect_low_value_lines_in_roi(
             return [], [], [], []
 
         view = img[y1i:y2i, x1i:x2i]
-        # bool mask: DN in [dn_lo, dn_hi]
-        mask = (view >= float(dn_lo)) & (view <= float(dn_hi))
+        roi_mean = float(np.mean(view))
+        if not np.isfinite(roi_mean):
+            return [], [], [], []
+
+        try:
+            drop_ratio_f = float(drop_ratio)
+        except Exception:
+            drop_ratio_f = 0.1
+        drop_ratio_f = max(0.0, min(1.0, drop_ratio_f))
+
+        try:
+            frac_threshold_f = float(frac_threshold)
+        except Exception:
+            frac_threshold_f = 0.1
+        frac_threshold_f = max(0.0, min(1.0, frac_threshold_f))
+
+        low_thr = roi_mean * (1.0 - drop_ratio_f)
+        # bool mask: DN <= ROI_mean * (1 - drop_ratio)
+        mask = view <= float(low_thr)
 
         # 비율 계산 (column/row)
         col_frac = mask.mean(axis=0)  # (roi_w,)
         row_frac = mask.mean(axis=1)  # (roi_h,)
 
-        bad_cols_rel = np.where(col_frac >= float(frac_threshold))[0].astype(np.int64)
-        bad_rows_rel = np.where(row_frac >= float(frac_threshold))[0].astype(np.int64)
+        bad_cols_rel = np.where(col_frac >= float(frac_threshold_f))[0].astype(np.int64)
+        bad_rows_rel = np.where(row_frac >= float(frac_threshold_f))[0].astype(np.int64)
 
         bad_cols = (bad_cols_rel + int(x1i)).tolist()
         bad_rows = (bad_rows_rel + int(y1i)).tolist()
@@ -1094,6 +1163,12 @@ class BlemishParamDialog(QWidget):
 
         self.db_min_circ = QDoubleSpinBox(); self.db_min_circ.setRange(0, 1); self.db_min_circ.setDecimals(4); self.db_min_circ.setValue(float(self._params.get("min_circularity", 0.0)))
         self.db_max_ecc = QDoubleSpinBox(); self.db_max_ecc.setRange(0, 1); self.db_max_ecc.setDecimals(4); self.db_max_ecc.setValue(float(self._params.get("max_eccentricity", 1.0)))
+        self.db_line_drop = QDoubleSpinBox(); self.db_line_drop.setRange(0, 1); self.db_line_drop.setDecimals(3); self.db_line_drop.setValue(float(self._params.get("line_drop_ratio", 0.1)))
+        self.db_line_frac = QDoubleSpinBox(); self.db_line_frac.setRange(0, 1); self.db_line_frac.setDecimals(3); self.db_line_frac.setValue(float(self._params.get("line_frac_threshold", 0.1)))
+        self.le_line_ex_x = QLineEdit(str(self._params.get("line_exclude_x", "")))
+        self.le_line_ex_y = QLineEdit(str(self._params.get("line_exclude_y", "")))
+        self.sp_line_margin = QSpinBox(); self.sp_line_margin.setRange(0, 10000); self.sp_line_margin.setValue(int(self._params.get("line_ignore_margin_px", 8)))
+        self.db_line_break_jump = QDoubleSpinBox(); self.db_line_break_jump.setRange(0, 1); self.db_line_break_jump.setDecimals(3); self.db_line_break_jump.setValue(float(self._params.get("line_break_jump_ratio", 0.5)))
 
         # form rows
         form.addRow("Scope", self.cb_scope)
@@ -1111,6 +1186,12 @@ class BlemishParamDialog(QWidget):
         form.addRow("Min DN", self.sp_min_dn)
         form.addRow("Min Circ", self.db_min_circ)
         form.addRow("Max Ecc", self.db_max_ecc)
+        form.addRow("Line Drop Ratio", self.db_line_drop)
+        form.addRow("Line Low Fraction", self.db_line_frac)
+        form.addRow("Line Exclude X", self.le_line_ex_x)
+        form.addRow("Line Exclude Y", self.le_line_ex_y)
+        form.addRow("Line Ignore Margin(px)", self.sp_line_margin)
+        form.addRow("Line Break Jump", self.db_line_break_jump)
 
         btns = QHBoxLayout()
         layout.addLayout(btns)
@@ -1164,6 +1245,12 @@ class BlemishParamDialog(QWidget):
             "min_dn": int(self.sp_min_dn.value()),
             "min_circularity": float(self.db_min_circ.value()),
             "max_eccentricity": float(self.db_max_ecc.value()),
+            "line_drop_ratio": float(self.db_line_drop.value()),
+            "line_frac_threshold": float(self.db_line_frac.value()),
+            "line_exclude_x": str(self.le_line_ex_x.text()).strip(),
+            "line_exclude_y": str(self.le_line_ex_y.text()).strip(),
+            "line_ignore_margin_px": int(self.sp_line_margin.value()),
+            "line_break_jump_ratio": float(self.db_line_break_jump.value()),
         }
         self.applied.emit(p)
 
@@ -1338,6 +1425,7 @@ class XrayNapariWidget(QSplitter):
         self.height: Optional[int] = None
         self.loaded_file_path: Optional[str] = None
         self.blemish_save_dir: Optional[str] = None
+        self._open_default_dir: str = r"\\192.168.0.10"
 
         # ---------------------------
         # background detect (QThread) + result cache
@@ -1370,6 +1458,8 @@ class XrayNapariWidget(QSplitter):
         self.blemish_last_img_full: Optional[np.ndarray] = None
         self.blemish_last_candidates: List[BlemishCandidate] = []
         self.blemish_last_ref_mean: Optional[float] = None
+        self._line_coords: List[Tuple[str, int, bool]] = []
+        self._table_rows: List[Tuple[str, int]] = []
 
         # pixel pitch (cm/pixel): legacy (area now displayed in px^2)
         self.pixel_pitch_cm: Optional[float] = None
@@ -1764,7 +1854,7 @@ class XrayNapariWidget(QSplitter):
         # ROI는 Raw 뷰에서 Shift+좌클릭 드래그로 그립니다.
 
         # ---- Blemish group (Process UI 제거 -> 이 영역을 더 크게)
-        gb_blm = QGroupBox("2. Blemish")
+        gb_blm = QGroupBox("2. Result")
         bl = QVBoxLayout(gb_blm)
 
         rowt = QHBoxLayout()
@@ -2756,8 +2846,9 @@ class XrayNapariWidget(QSplitter):
             show_err(self, "Error", "This model/type has no fixed dimensions.")
             return
 
+        dialog_dir = self._open_default_dir if os.path.isdir(self._open_default_dir) else ""
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open Raw", "", "IMG/RAW (*.IMG *.img *.raw *.RAW);;All (*.*)"
+            self, "Open Raw", dialog_dir, "IMG/RAW (*.IMG *.img *.raw *.RAW);;All (*.*)"
         )
         if not file_path:
             return
@@ -2822,6 +2913,8 @@ class XrayNapariWidget(QSplitter):
             self.loaded_file_path = file_path
             self._fit_after_load = True  # 새 파일 로딩 시 1회 reset_view
             self.blemish_save_dir = os.path.dirname(file_path) if os.path.isdir(os.path.dirname(file_path)) else None
+            if self._open_default_dir:
+                self._open_default_dir = os.path.dirname(file_path) or self._open_default_dir
 
             self._ensure_layers()
             self._clear_roi_and_blemish_layers()
@@ -2846,6 +2939,7 @@ class XrayNapariWidget(QSplitter):
             # status에는 실제 표시 크기를 표기
             self._set_status(f"Loaded: {os.path.basename(file_path)} ({self.width}x{self.height}){roi_desc}")
         except Exception as e:
+            self._open_default_dir = ""
             show_err(self, "Load Error", str(e))
 
 
@@ -2861,14 +2955,76 @@ class XrayNapariWidget(QSplitter):
                 return
             roi = self.roi_bounds if (self.roi_bounds is not None and getattr(self.roi_bounds, 'valid', False)) else None
 
+            try:
+                drop_ratio = float(self.blemish_params.get("line_drop_ratio", 0.1))
+            except Exception:
+                drop_ratio = 0.1
+            try:
+                frac_threshold = float(self.blemish_params.get("line_frac_threshold", 0.1))
+            except Exception:
+                frac_threshold = 0.1
+            try:
+                ignore_margin = int(self.blemish_params.get("line_ignore_margin_px", 8))
+            except Exception:
+                ignore_margin = 8
+
             bad_cols, bad_rows, col_runs, row_runs = detect_low_value_lines_in_roi(
                 self.raw_data,
                 roi,
-                dn_lo=0.0,
-                dn_hi=100.0,
-                frac_threshold=0.95,
-                ignore_border_px=8,
+                drop_ratio=drop_ratio,
+                frac_threshold=frac_threshold,
+                ignore_border_px=ignore_margin,
             )
+
+            ex_x = _parse_line_exclude_list(self.blemish_params.get("line_exclude_x", ""))
+            ex_y = _parse_line_exclude_list(self.blemish_params.get("line_exclude_y", ""))
+            if ex_x:
+                bad_cols = [x for x in bad_cols if int(x) not in ex_x]
+            if ex_y:
+                bad_rows = [y for y in bad_rows if int(y) not in ex_y]
+            col_runs = _runs_from_sorted_indices(np.asarray(sorted(bad_cols), dtype=np.int64))
+            row_runs = _runs_from_sorted_indices(np.asarray(sorted(bad_rows), dtype=np.int64))
+
+            try:
+                break_jump = float(self.blemish_params.get("line_break_jump_ratio", 0.5))
+            except Exception:
+                break_jump = 0.5
+
+            broken_cols: set[int] = set()
+            broken_rows: set[int] = set()
+            try:
+                H, W = int(self.raw_data.shape[0]), int(self.raw_data.shape[1])
+                if roi is not None and getattr(roi, 'valid', False):
+                    x1, x2, y1, y2 = int(roi.x1), int(roi.x2), int(roi.y1), int(roi.y2)
+                else:
+                    x1, x2, y1, y2 = 0, W, 0, H
+
+                m = max(0, int(ignore_margin))
+                x1i = max(0, min(W, x1 + m))
+                x2i = max(0, min(W, x2 - m))
+                y1i = max(0, min(H, y1 + m))
+                y2i = max(0, min(H, y2 - m))
+
+                if (x2i - x1i) < 10 or (y2i - y1i) < 10:
+                    x1i, x2i, y1i, y2i = x1, x2, y1, y2
+
+                if (x2i - x1i) >= 2 and (y2i - y1i) >= 2:
+                    view = self.raw_data[y1i:y2i, x1i:x2i]
+                    roi_mean = float(np.mean(view))
+                    if np.isfinite(roi_mean):
+                        for x in bad_cols:
+                            rel = int(x) - int(x1i)
+                            if 0 <= rel < view.shape[1]:
+                                if _is_broken_line(view[:, rel], roi_mean, break_jump):
+                                    broken_cols.add(int(x))
+                        for y in bad_rows:
+                            rel = int(y) - int(y1i)
+                            if 0 <= rel < view.shape[0]:
+                                if _is_broken_line(view[rel, :], roi_mean, break_jump):
+                                    broken_rows.add(int(y))
+            except Exception:
+                broken_cols = set()
+                broken_rows = set()
 
             total_lines = int(len(bad_cols) + len(bad_rows))
             max_run = 0
@@ -2878,14 +3034,105 @@ class XrayNapariWidget(QSplitter):
                 except Exception:
                     pass
 
-            # 3개 이상(집합/다발) 발견 시 강한 경고
-            if total_lines >= 3 or max_run >= 3:
-                show_info(self, "3LINE 발견", "3LINE 발견, 확인필요!")
-            elif total_lines >= 1:
-                show_info(self, "LINE 발견", "LINE 발견, Raw -> Collected blemish 검사 추천!")
+            run3_cols: set[int] = set()
+            run3_rows: set[int] = set()
+            for s, e in col_runs:
+                if (int(e) - int(s) + 1) >= 3:
+                    for v in range(int(s), int(e) + 1):
+                        run3_cols.add(int(v))
+            for s, e in row_runs:
+                if (int(e) - int(s) + 1) >= 3:
+                    for v in range(int(s), int(e) + 1):
+                        run3_rows.add(int(v))
+
+            highlight_cols = [x for x in bad_cols if int(x) in broken_cols or int(x) in run3_cols]
+            highlight_rows = [y for y in bad_rows if int(y) in broken_rows or int(y) in run3_rows]
+            normal_cols = [x for x in bad_cols if int(x) not in broken_cols and int(x) not in run3_cols]
+            normal_rows = [y for y in bad_rows if int(y) not in broken_rows and int(y) not in run3_rows]
+            self._update_line_overlay(normal_cols, normal_rows, highlight_cols, highlight_rows, roi)
+
+            if total_lines > 0:
+                line_coords: List[Tuple[str, int, bool]] = []
+                for x in bad_cols:
+                    line_coords.append(("COL", int(x), int(x) in broken_cols))
+                for y in bad_rows:
+                    line_coords.append(("ROW", int(y), int(y) in broken_rows))
+                self._line_coords = line_coords
+            else:
+                self._line_coords = []
         except Exception:
             # 팝업 실패/예외는 동작을 막지 않음
             return
+    def _update_line_overlay(
+        self,
+        normal_cols: List[int],
+        normal_rows: List[int],
+        highlight_cols: List[int],
+        highlight_rows: List[int],
+        roi: Optional[RoiBounds],
+    ) -> None:
+        _remove_layers_by_prefix(self.model_result, "Line Detect")
+        if self.processed_data is None:
+            return
+        if not normal_cols and not normal_rows and not highlight_cols and not highlight_rows:
+            return
+
+        H, W = int(self.processed_data.shape[0]), int(self.processed_data.shape[1])
+        if roi is not None and getattr(roi, 'valid', False):
+            x1, x2, y1, y2 = int(roi.x1), int(roi.x2), int(roi.y1), int(roi.y2)
+        else:
+            x1, x2, y1, y2 = 0, W, 0, H
+
+        x1 = max(0, min(W, x1))
+        x2 = max(0, min(W, x2))
+        y1 = max(0, min(H, y1))
+        y2 = max(0, min(H, y2))
+        if x2 <= x1 or y2 <= y1:
+            return
+
+        mask = np.zeros((H, W), dtype=np.uint8)
+        if normal_cols:
+            for x in normal_cols:
+                xi = int(x)
+                if x1 <= xi < x2:
+                    mask[y1:y2, xi] = 1
+        if normal_rows:
+            for y in normal_rows:
+                yi = int(y)
+                if y1 <= yi < y2:
+                    mask[yi, x1:x2] = 1
+        if highlight_cols:
+            for x in highlight_cols:
+                xi = int(x)
+                if x1 <= xi < x2:
+                    mask[y1:y2, xi] = 2
+        if highlight_rows:
+            for y in highlight_rows:
+                yi = int(y)
+                if y1 <= yi < y2:
+                    mask[yi, x1:x2] = 2
+
+        if not np.any(mask):
+            return
+
+        try:
+            lay = self.model_result.add_labels(
+                mask,
+                name="Line Detect",
+                opacity=1.0,
+                color={1: "orange", 2: "yellow"},
+            )
+        except Exception:
+            lay = self.model_result.add_labels(mask, name="Line Detect", opacity=1.0)
+            try:
+                lay.color = {1: "orange", 2: "yellow"}
+            except Exception:
+                pass
+        try:
+            lay.interactive = False
+        except Exception:
+            pass
+
     # ---------------------------
     # ROI
     # ---------------------------
@@ -2959,7 +3206,10 @@ class XrayNapariWidget(QSplitter):
         self.blemish_last_candidates = []
         self.blemish_last_img_full = None
         self.blemish_last_ref_mean = None
+        self._line_coords = []
+        self._table_rows = []
         self._update_blemish_text_overlay(clear_only=True)
+        _remove_layers_by_prefix(self.model_result, "Line Detect")
         if self.layer_crop is not None:
             self.layer_crop.data = np.zeros((10, 10), np.float32)
             self.layer_crop.contrast_limits = (0, 1)
@@ -3487,6 +3737,11 @@ class XrayNapariWidget(QSplitter):
         if img is None:
             return
 
+        try:
+            self._check_low_dn_line_and_popup()
+        except Exception:
+            pass
+
         # cache check (cache hit이면 즉시 UI 반영)
         cache_key = self._make_detect_cache_key(img, tgt)
         cached = self._detect_cache_get(cache_key)
@@ -3517,12 +3772,14 @@ class XrayNapariWidget(QSplitter):
         self._start_detect_job(img, str(tgt), params_copy, roi_copy, cache_key)
     def _populate_table(self) -> None:
         self.tbl.setRowCount(0)
+        self._table_rows = []
 
         # area unit: px^2 (pixel count)
 
-        for c in self.blemish_last_candidates:
+        for idx, c in enumerate(self.blemish_last_candidates):
             r = self.tbl.rowCount()
             self.tbl.insertRow(r)
+            self._table_rows.append(("blemish", int(idx)))
 
             self.tbl.setItem(r, 0, QTableWidgetItem(f"({c.x},{c.y})"))
 
@@ -3539,11 +3796,59 @@ class XrayNapariWidget(QSplitter):
             area_px = int(getattr(c, "area_px", 0) or 0)
             self.tbl.setItem(r, 3, QTableWidgetItem(f"{area_px}"))
 
+        if self._line_coords:
+            cols = sorted([v for a, v, _b in self._line_coords if str(a).upper() == "COL"])
+            rows = sorted([v for a, v, _b in self._line_coords if str(a).upper() == "ROW"])
+            col_run_map: Dict[int, int] = {}
+            row_run_map: Dict[int, int] = {}
+
+            def _fill_run_map(values: List[int], out_map: Dict[int, int]) -> None:
+                if not values:
+                    return
+                arr = np.asarray(sorted(values), dtype=np.int64)
+                for s, e in _runs_from_sorted_indices(arr):
+                    ln = int(e) - int(s) + 1
+                    for v in range(int(s), int(e) + 1):
+                        out_map[int(v)] = ln
+
+            _fill_run_map(cols, col_run_map)
+            _fill_run_map(rows, row_run_map)
+
+            for axis, val, is_broken in self._line_coords:
+                r = self.tbl.rowCount()
+                self.tbl.insertRow(r)
+                self._table_rows.append(("line", -1))
+                if str(axis).upper() == "COL":
+                    coord_txt = f"({int(val)},-)"
+                    run_len = int(col_run_map.get(int(val), 1))
+                else:
+                    coord_txt = f"(-,{int(val)})"
+                    run_len = int(row_run_map.get(int(val), 1))
+                self.tbl.setItem(r, 0, QTableWidgetItem(coord_txt))
+                is_three = run_len >= 3
+                if is_three and is_broken:
+                    label = "3Line/Broken"
+                elif is_three:
+                    label = "3Line"
+                elif is_broken:
+                    label = "Broken"
+                else:
+                    label = "Line"
+                self.tbl.setItem(r, 1, QTableWidgetItem(label))
+                self.tbl.setItem(r, 2, QTableWidgetItem("-"))
+                self.tbl.setItem(r, 3, QTableWidgetItem("-"))
+
         if self.tbl.rowCount() > 0:
             self.tbl.selectRow(0)
 
     def _on_table_clicked(self, row: int, _col: int) -> None:
-        self._render_candidate_crop(row)
+        try:
+            kind, idx = self._table_rows[row]
+        except Exception:
+            return
+        if kind != "blemish":
+            return
+        self._render_candidate_crop(int(idx))
 
     def _render_candidate_crop(self, idx: int) -> None:
         if self.blemish_last_img_full is None:
