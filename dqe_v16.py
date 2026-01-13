@@ -36,6 +36,14 @@ from collections import OrderedDict
 
 import numpy as np
 from scipy.ndimage import uniform_filter, label as nd_label, find_objects, binary_erosion, binary_dilation
+# import datetime  # removed to avoid shadowing datetime class
+import matplotlib.pyplot as plt
+from matplotlib.widgets import SpanSelector
+from matplotlib.figure import Figure
+try:
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvasQTAgg
+except Exception:  # pragma: no cover
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvasQTAgg
 
 # Text overlay rendering (robust across napari versions)
 from PIL import Image as PILImage
@@ -66,6 +74,8 @@ from qtpy.QtWidgets import (
     QTabWidget,
     QVBoxLayout,
     QWidget,
+    QDialog,
+    QPlainTextEdit,
 )
 
 # -----------------------------------------------------------------------------
@@ -464,6 +474,18 @@ def default_blemish_params() -> Dict[str, Any]:
         "line_exclude_y": "",
         "line_ignore_margin_px": 8,
         "line_break_jump_ratio": 0.5,
+        # ---------------------------
+        # CTF (CTF analysis settings)
+        # ---------------------------
+        # 최대 lp/mm 범위 (2~4). 기본은 2lp/mm까지만 계산.
+        "ctf_range": 2,
+        # ROI 감도 계산용 ROI (x,y,w,h) : 모델별로 프로파일에 저장
+        "ctf_roi_x": 0,
+        "ctf_roi_y": 0,
+        "ctf_roi_w": 0,
+        "ctf_roi_h": 0,
+
+
 
     }
 
@@ -526,6 +548,145 @@ def _resource_path(rel_path: str) -> str:
     return os.path.join(base, rel_path)
 
 
+
+def _shift_pressed(ev) -> bool:
+    """Best-effort check whether Shift is pressed for a napari/Qt mouse event."""
+    # 1) napari event.modifiers (can be tuple/list/set/enum-like)
+    try:
+        mods = getattr(ev, 'modifiers', None)
+        if mods is not None:
+            if isinstance(mods, (list, tuple, set)):
+                for m in mods:
+                    if 'shift' in str(m).lower():
+                        return True
+            else:
+                if 'shift' in str(mods).lower():
+                    return True
+    except Exception:
+        pass
+    # 2) napari event.native (Qt event)
+    try:
+        native = getattr(ev, 'native', None)
+        if native is not None and hasattr(native, 'modifiers'):
+            if native.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                return True
+    except Exception:
+        pass
+    # 3) global keyboard state (Qt)
+    try:
+        return bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+    except Exception:
+        return False
+
+
+
+def _ctrl_pressed(ev) -> bool:
+    """Best-effort check whether Ctrl is pressed for a napari/Qt mouse event."""
+    # 1) napari event.modifiers (can be tuple/list/set/enum-like)
+    try:
+        mods = getattr(ev, 'modifiers', None)
+        if mods is not None:
+            if isinstance(mods, (list, tuple, set)):
+                for m in mods:
+                    s = str(m).lower()
+                    if ('ctrl' in s) or ('control' in s):
+                        return True
+            else:
+                s = str(mods).lower()
+                if ('ctrl' in s) or ('control' in s):
+                    return True
+    except Exception:
+        pass
+    # 2) napari event.native (Qt event)
+    try:
+        native = getattr(ev, 'native', None)
+        if native is not None and hasattr(native, 'modifiers'):
+            if native.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                return True
+    except Exception:
+        pass
+    # 3) global keyboard state (Qt)
+    try:
+        return bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier)
+    except Exception:
+        return False
+
+
+
+def _left_button(ev) -> bool:
+    """Best-effort check for left mouse button across napari/Qt variants."""
+    # 1) napari MouseEvent.button
+    btn = getattr(ev, 'button', None)
+    if btn is not None:
+        # napari can provide strings like 'left' / 'primary'
+        if isinstance(btn, str):
+            b = btn.lower()
+            if ('left' in b) or ('primary' in b):
+                return True
+        # Qt enum
+        try:
+            if btn == Qt.MouseButton.LeftButton:
+                return True
+        except Exception:
+            pass
+        # common int code for left
+        try:
+            if int(btn) == 1:
+                return True
+        except Exception:
+            pass
+        if btn == 1:
+            return True
+
+    # 2) napari event.native (Qt event)
+    try:
+        native = getattr(ev, 'native', None)
+        if native is not None and hasattr(native, 'button'):
+            if native.button() == Qt.MouseButton.LeftButton:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+
+
+def _middle_button(ev) -> bool:
+    """Best-effort check for middle/wheel mouse button across napari/Qt variants."""
+    # 1) napari MouseEvent.button
+    btn = getattr(ev, 'button', None)
+    if btn is not None:
+        # napari can provide strings like 'middle'
+        if isinstance(btn, str):
+            b = btn.lower()
+            if ('middle' in b) or (b == 'mid') or ('button2' in b):
+                return True
+        # Qt enum
+        try:
+            if btn == Qt.MouseButton.MiddleButton:
+                return True
+        except Exception:
+            pass
+        # common int code for middle
+        try:
+            if int(btn) == 2:
+                return True
+        except Exception:
+            pass
+        if btn == 2:
+            return True
+
+    # 2) napari event.native (Qt event)
+    try:
+        native = getattr(ev, 'native', None)
+        if native is not None and hasattr(native, 'button'):
+            if native.button() == Qt.MouseButton.MiddleButton:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def show_err(parent: QWidget, title: str, msg: str) -> None:
     QMessageBox.critical(parent, title, msg)
 
@@ -541,6 +702,65 @@ def show_info(parent: QWidget, title: str, msg: str) -> None:
 # - 핵심: LayerList(model.layers)에는 add_image 같은 메서드가 없습니다.
 #   반드시 viewer/viewermodel의 add_* 를 사용해야 합니다.
 # ---------------------------
+
+class CTFResultDialog(QDialog):
+    def __init__(self, parent: QWidget, output_text: str, fig=None, default_dir: Optional[str] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle('CTF Results')
+        self._output_text = output_text or ''
+        self._default_dir = default_dir or ''
+        layout = QVBoxLayout(self)
+        # (optional) plot
+        self._canvas = None
+        try:
+            if fig is not None:
+                self._canvas = FigureCanvasQTAgg(fig)
+                layout.addWidget(self._canvas)
+        except Exception:
+            self._canvas = None
+        # text
+        self._text = QPlainTextEdit()
+        self._text.setReadOnly(True)
+        self._text.setPlainText(self._output_text)
+        try:
+            self._text.setMinimumHeight(200)
+        except Exception:
+            pass
+        layout.addWidget(self._text)
+        # buttons
+        row = QHBoxLayout()
+        self._btn_copy = QPushButton('Copy')
+        self._btn_save = QPushButton('Save TXT')
+        self._btn_close = QPushButton('Close')
+        row.addWidget(self._btn_copy)
+        row.addWidget(self._btn_save)
+        row.addStretch(1)
+        row.addWidget(self._btn_close)
+        layout.addLayout(row)
+        self._btn_copy.clicked.connect(self._on_copy)
+        self._btn_save.clicked.connect(self._on_save)
+        self._btn_close.clicked.connect(self.accept)
+
+    def _on_copy(self) -> None:
+        try:
+            QApplication.clipboard().setText(self._output_text)
+        except Exception:
+            pass
+
+    def _on_save(self) -> None:
+        try:
+            dialog_dir = self._default_dir if (self._default_dir and os.path.isdir(self._default_dir)) else ''
+            file_path, _ = QFileDialog.getSaveFileName(self, 'Save CTF Result', dialog_dir, 'Text (*.txt);;All (*.*)')
+            if not file_path:
+                return
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(self._output_text)
+        except Exception as e:
+            try:
+                show_err(self, 'Save Error', str(e))
+            except Exception:
+                pass
+
 
 def add_image_to_model(
     model: ViewerModel,
@@ -1203,6 +1423,21 @@ class BlemishParamDialog(QWidget):
         form.addRow("Line Ignore Margin(px)", self.sp_line_margin)
         form.addRow("Line Break Jump", self.db_line_break_jump)
 
+        # ---------------------------
+        # CTF params (shared profile store)
+        # ---------------------------
+        self.sp_ctf_range = QSpinBox(); self.sp_ctf_range.setRange(2, 4); self.sp_ctf_range.setValue(int(self._params.get("ctf_range", 2)))
+        self.sp_ctf_roi_x = QSpinBox(); self.sp_ctf_roi_x.setRange(0, 99999); self.sp_ctf_roi_x.setValue(int(self._params.get("ctf_roi_x", 0)))
+        self.sp_ctf_roi_y = QSpinBox(); self.sp_ctf_roi_y.setRange(0, 99999); self.sp_ctf_roi_y.setValue(int(self._params.get("ctf_roi_y", 0)))
+        self.sp_ctf_roi_w = QSpinBox(); self.sp_ctf_roi_w.setRange(0, 99999); self.sp_ctf_roi_w.setValue(int(self._params.get("ctf_roi_w", 0)))
+        self.sp_ctf_roi_h = QSpinBox(); self.sp_ctf_roi_h.setRange(0, 99999); self.sp_ctf_roi_h.setValue(int(self._params.get("ctf_roi_h", 0)))
+
+        form.addRow("CTF Range (lp/mm)", self.sp_ctf_range)
+        form.addRow("CTF ROI X", self.sp_ctf_roi_x)
+        form.addRow("CTF ROI Y", self.sp_ctf_roi_y)
+        form.addRow("CTF ROI W", self.sp_ctf_roi_w)
+        form.addRow("CTF ROI H", self.sp_ctf_roi_h)
+
         btns = QHBoxLayout()
         layout.addLayout(btns)
         btn_apply = QPushButton("Apply")
@@ -1261,6 +1496,12 @@ class BlemishParamDialog(QWidget):
             "line_exclude_y": str(self.le_line_ex_y.text()).strip(),
             "line_ignore_margin_px": int(self.sp_line_margin.value()),
             "line_break_jump_ratio": float(self.db_line_break_jump.value()),
+            # CTF
+            "ctf_range": int(self.sp_ctf_range.value()),
+            "ctf_roi_x": int(self.sp_ctf_roi_x.value()),
+            "ctf_roi_y": int(self.sp_ctf_roi_y.value()),
+            "ctf_roi_w": int(self.sp_ctf_roi_w.value()),
+            "ctf_roi_h": int(self.sp_ctf_roi_h.value()),
         }
         self.applied.emit(p)
 
@@ -1288,6 +1529,7 @@ class _QtPanLwFilter(QObject):
         self._which = which
         self._drag_right = False
         self._drag_left = False
+        self._moved_left = False
         self._start_pos = None
         self._start_clim = None
         self._start_center = None
@@ -1317,6 +1559,41 @@ class _QtPanLwFilter(QObject):
                     # Shift 제스처는 napari 콜백에 위임
                     return False
 
+                # CTF point selection: handle wheel-click (middle button) at Qt level.
+                # Napari's mouse_click_callbacks may not fire for middle clicks on some systems.
+                try:
+                    if (self._which == "raw") and getattr(self._owner, "_ctf_mode", False):
+                        if event.button() == Qt.MouseButton.MiddleButton:
+                            # Use current cursor world position maintained by ViewerModel
+                            pos = None
+                            try:
+                                cur = getattr(self._owner.model_raw, "cursor", None)
+                                pos = getattr(cur, "position", None) if cur is not None else None
+                            except Exception:
+                                pos = None
+                            if pos is not None:
+                                try:
+                                    y = int(round(float(pos[-2])))
+                                    x = int(round(float(pos[-1])))
+                                except Exception:
+                                    y = x = None
+                                if y is not None and x is not None:
+                                    img = getattr(self._owner, "ctf_data", None)
+                                    if img is not None:
+                                        try:
+                                            h, w = img.shape[:2]
+                                            y = max(0, min(int(h) - 1, y))
+                                            x = max(0, min(int(w) - 1, x))
+                                        except Exception:
+                                            pass
+                                    try:
+                                        self._owner._ctf_add_point(y, x)
+                                    except Exception:
+                                        pass
+                            return True
+                except Exception:
+                    pass
+
                 if event.button() == Qt.MouseButton.RightButton:
                     layer = self._owner._layer_for_view(self._which)
                     if layer is None:
@@ -1334,6 +1611,8 @@ class _QtPanLwFilter(QObject):
                     cam = self._owner._camera_for_view(self._which)
                     if cam is None:
                         return False
+                    # In CTF mode, use Wheel click to pass through to napari callbacks (avoid conflicts)
+                    # (CTF point selection uses wheel click; keep left-drag pan.)
                     self._start_pos = event.pos()
                     try:
                         self._start_center = tuple(cam.center)
@@ -1344,6 +1623,7 @@ class _QtPanLwFilter(QObject):
                     except Exception:
                         self._start_zoom = 1.0
                     self._drag_left = True
+                    self._moved_left = False
                     return True
             except Exception:
                 return False
@@ -1381,6 +1661,14 @@ class _QtPanLwFilter(QObject):
                     dx = float(event.pos().x() - self._start_pos.x())
                     dy = float(event.pos().y() - self._start_pos.y())
 
+                    # CTF mode: let simple clicks pass through (no drag pan) until movement exceeds threshold
+                    if getattr(self._owner, '_ctf_mode', False) and self._which == 'raw':
+                        try:
+                            if not self._moved_left and (dx * dx + dy * dy) < 9.0:
+                                return False
+                            self._moved_left = True
+                        except Exception:
+                            self._moved_left = True
                     # napari camera.center는 (y,x) 또는 (z,y,x) 등일 수 있어 뒤에서부터 적용
                     try:
                         z = float(getattr(cam, "zoom", None) or self._start_zoom or 1.0)
@@ -1406,6 +1694,11 @@ class _QtPanLwFilter(QObject):
                     return True
                 if self._drag_left and event.button() == Qt.MouseButton.LeftButton:
                     self._drag_left = False
+                    moved = bool(getattr(self, '_moved_left', False))
+                    self._moved_left = False
+                    if getattr(self._owner, '_ctf_mode', False) and self._which == 'raw' and not moved and ((event.modifiers() & Qt.KeyboardModifier.ControlModifier) or (QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier)):
+                        # propagate release so napari click callbacks can run
+                        return False
                     return True
             except Exception:
                 return False
@@ -1455,6 +1748,21 @@ class XrayNapariWidget(QSplitter):
 
         # ROI
         self.roi_bounds: Optional[RoiBounds] = None
+
+        # CTF mode (line selection + CTF calc)
+        self._ctf_mode: bool = False
+        self.ctf_loaded_file_path: Optional[str] = None
+        self.ctf_save_dir: Optional[str] = None
+        self.ctf_data: Optional[np.ndarray] = None  # currently loaded CTF image (displayed in Raw when _ctf_mode)
+        self._ctf_points: List[Tuple[int, int]] = []  # (y, x)
+        self._ctf_select_fig = None
+        self._ctf_last_profile: Optional[np.ndarray] = None
+        self._ctf_result_dialog: Optional[CTFResultDialog] = None
+        # White(Reference) image loaded via 'Load Raw' (used for sensitivity means in CTF output)
+        self.white_data: Optional[np.ndarray] = None
+        self.white_loaded_file_path: Optional[str] = None
+
+
 
         # ROI: Shift+좌클릭 드래그로 1개만 그리도록 제어
         self._roi_internal_update = False
@@ -1519,6 +1827,8 @@ class XrayNapariWidget(QSplitter):
         self.layer_result: Optional[NapariImageLayer] = None
         self.layer_crop: Optional[NapariImageLayer] = None
         self.layer_roi: Optional[NapariShapesLayer] = None
+        self.layer_ctf_points: Optional[Any] = None  # napari Points layer (CTF line endpoints)
+        self.layer_ctf_line: Optional[Any] = None    # napari Shapes layer (CTF line)
         self.layer_blemish_points: Optional[Any] = None  # napari Points layer
         self.layer_blemish_boxes: Optional[Any] = None   # napari Shapes layer (rectangle boxes)
 
@@ -1681,6 +1991,50 @@ class XrayNapariWidget(QSplitter):
         except Exception:
             pass
         self._normalize_cropdelta_thresholds(p)
+        # ---------------------------
+        # CTF params defaults (per model profile)
+        # ---------------------------
+        try:
+            rng = int(p.get("ctf_range", 2))
+        except Exception:
+            rng = 2
+        rng = max(2, min(4, rng))
+        p["ctf_range"] = rng
+
+        # ROI sensitivity defaults: use ROI preset (after orientation correction) if available,
+        # otherwise use full image (display coordinates).
+        try:
+            ctf_rx = int(p.get("ctf_roi_x", 0))
+            ctf_ry = int(p.get("ctf_roi_y", 0))
+            ctf_rw = int(p.get("ctf_roi_w", 0))
+            ctf_rh = int(p.get("ctf_roi_h", 0))
+        except Exception:
+            ctf_rx, ctf_ry, ctf_rw, ctf_rh = 0, 0, 0, 0
+
+        if ctf_rw <= 0 or ctf_rh <= 0:
+            try:
+                ow, oh = MODEL_DIMENSIONS.get(model, {}).get("Probe", (0, 0))
+                preset = ROI_PRESETS_XY.get(model)
+                if preset is not None and ow and oh:
+                    (x1, y1), (x2, y2) = preset
+                    x1, y1, x2, y2 = orient_transform_box_xy(model, x1, y1, x2, y2, ow, oh)
+                    ctf_rx = int(x1)
+                    ctf_ry = int(y1)
+                    ctf_rw = int(max(1, int(x2) - int(x1)))
+                    ctf_rh = int(max(1, int(y2) - int(y1)))
+                else:
+                    disp_w, disp_h = int(ow), int(oh)
+                    if model in ORIENT_ROTATE_LEFT_FLIP_H_MODELS:
+                        disp_w, disp_h = int(oh), int(ow)
+                    ctf_rx, ctf_ry, ctf_rw, ctf_rh = 0, 0, max(1, disp_w), max(1, disp_h)
+            except Exception:
+                pass
+
+        p["ctf_roi_x"] = int(ctf_rx)
+        p["ctf_roi_y"] = int(ctf_ry)
+        p["ctf_roi_w"] = int(ctf_rw)
+        p["ctf_roi_h"] = int(ctf_rh)
+
         self.blemish_params = p
         self.blemish_profile_key = self._profile_key(model, typ)
         self.blemish_profile_saved_at = saved_at
@@ -1859,10 +2213,14 @@ class XrayNapariWidget(QSplitter):
 
         self.btn_load = QPushButton("Load Raw (.IMG/.raw)")
         gl.addWidget(self.btn_load)
+        self.btn_load_ctf = QPushButton('Load CTF (.IMG/.raw)')
+        self.btn_load_ctf.setEnabled(False)  # enabled after Load Raw
+        gl.addWidget(self.btn_load_ctf)
 
         self.cb_model.currentTextChanged.connect(self._on_model_changed)
         self.cb_type.currentTextChanged.connect(self._on_type_changed)
         self.btn_load.clicked.connect(self._on_load_clicked)
+        self.btn_load_ctf.clicked.connect(self._on_load_ctf_clicked)
 
         # init type list
         self._on_model_changed(self.cb_model.currentText())
@@ -1882,15 +2240,18 @@ class XrayNapariWidget(QSplitter):
         bl.addLayout(rowt)
 
         rowb = QHBoxLayout()
-        self.btn_detect = QPushButton("Detect")
+        self.btn_detect = QPushButton("Blemish")
+        self.btn_ctf = QPushButton("CTF")
         self.btn_save_crop = QPushButton("Save Crop")
         self.btn_param = QPushButton("Param")
         rowb.addWidget(self.btn_detect)
+        rowb.addWidget(self.btn_ctf)
         rowb.addWidget(self.btn_save_crop)
         rowb.addWidget(self.btn_param)
         bl.addLayout(rowb)
 
         self.btn_detect.clicked.connect(self._on_detect)
+        self.btn_ctf.clicked.connect(self._on_ctf)
         self.btn_save_crop.clicked.connect(self._on_save_crop)
         self.btn_param.clicked.connect(self._on_param)
 
@@ -2026,6 +2387,46 @@ class XrayNapariWidget(QSplitter):
             except Exception:
                 pass
             self.layer_roi.events.data.connect(self._on_roi_changed)
+
+        # CTF overlays (raw viewer only)
+        if self.layer_ctf_points is None:
+            try:
+                self.layer_ctf_points = add_points_to_model(
+                    self.model_raw,
+                    np.zeros((0, 2), np.float32),
+                    name='CTF Points',
+                    size=10.0,
+                    face_color='yellow',
+                    opacity=0.9,
+                )
+                try:
+                    self.layer_ctf_points.interactive = False
+                except Exception:
+                    pass
+            except Exception:
+                self.layer_ctf_points = None
+
+        if self.layer_ctf_line is None:
+            try:
+                self.layer_ctf_line = add_shapes_to_model(
+                    self.model_raw,
+                    name='CTF Line',
+                    shape_type='line',
+                    edge_color='yellow',
+                    face_color=[0, 0, 0, 0],
+                    edge_width=2,
+                )
+                try:
+                    self.layer_ctf_line.interactive = False
+                except Exception:
+                    pass
+                try:
+                    self.layer_ctf_line.editable = False
+                except Exception:
+                    pass
+            except Exception:
+                self.layer_ctf_line = None
+
 
     def _layer_for_view(self, which: str):
         self._ensure_layers()
@@ -2450,6 +2851,13 @@ class XrayNapariWidget(QSplitter):
                 except Exception:
                     return
 
+                # In CTF mode, wheel click is used for point selection; do not reset view.
+                try:
+                    if getattr(self, '_ctf_mode', False):
+                        return
+                except Exception:
+                    pass
+
                 _reset_all(which)
 
                 try:
@@ -2840,6 +3248,7 @@ class XrayNapariWidget(QSplitter):
             pass
         try:
             self.model_raw.mouse_click_callbacks.append(make_shift_right_click_clear_roi_cb())
+            self.model_raw.mouse_click_callbacks.append(self._on_raw_click_for_ctf)
         except Exception:
             pass
 
@@ -2853,9 +3262,606 @@ class XrayNapariWidget(QSplitter):
         except Exception:
             pass
 
+    # ---------------------------
+    # CTF (3LP) integration
+    # ---------------------------
+    def _clear_ctf_layers(self) -> None:
+        """Clear CTF points/line overlays and any in-progress CTF selection UI."""
+        try:
+            self._ctf_points = []
+        except Exception:
+            pass
+        try:
+            self._ctf_last_profile = None
+        except Exception:
+            pass
+        try:
+            if self.layer_ctf_points is not None:
+                self.layer_ctf_points.data = np.zeros((0, 2), np.float32)
+        except Exception:
+            pass
+        try:
+            if self.layer_ctf_line is not None:
+                self.layer_ctf_line.data = []
+        except Exception:
+            pass
+        try:
+            if self._ctf_select_fig is not None:
+                plt.close(self._ctf_select_fig)
+        except Exception:
+            pass
+        self._ctf_select_fig = None
+        try:
+            if self._ctf_result_dialog is not None:
+                self._ctf_result_dialog.close()
+        except Exception:
+            pass
+        self._ctf_result_dialog = None
+
+    def _on_load_ctf_clicked(self) -> None:
+        """Load a CTF image (.IMG/.raw) and display it in the Raw preview (left).
+
+        Important:
+        - Does NOT clear existing collected preview images or blemish/line result lists.
+        - Uses the currently selected Model/Type. ROI stays as-is.
+        - CTF image is shown in the Raw viewer while keeping the previous Blemish results intact.
+        """
+        model = self.cb_model.currentText()
+        typ = self.cb_type.currentText()
+
+        # Require White(reference) image loaded via Load Raw before enabling CTF
+        if getattr(self, 'white_data', None) is None:
+            show_info(self, 'CTF', 'Load Raw(White) image first. (Load CTF is enabled after Load Raw)')
+            self._ctf_mode = False
+            return
+
+        # enable CTF mode
+        self._ctf_mode = True
+        self._clear_ctf_layers()
+
+        # keep dims consistent with current model/type profile
+        try:
+            self._load_profile_params_for_current_selection()
+        except Exception:
+            pass
+        w, h = MODEL_DIMENSIONS.get(model, {}).get(typ, (None, None))
+        if w is None or h is None:
+            show_err(self, 'Error', 'This model/type has no fixed dimensions.')
+            return
+
+        dialog_dir = self._open_default_dir if os.path.isdir(self._open_default_dir) else ''
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 'Open CTF', dialog_dir, 'IMG/RAW (*.IMG *.img *.raw *.RAW);;All (*.*)'
+        )
+        if not file_path:
+            return
+
+        try:
+            size_bytes = int(w) * int(h) * 2
+            fsz = os.path.getsize(file_path)
+            header = fsz - size_bytes
+            if header < 0:
+                raise ValueError('File too small for expected dimensions')
+
+            with open(file_path, 'rb') as fp:
+                fp.seek(header)
+                data = np.fromfile(fp, dtype=np.uint16, count=int(w) * int(h))
+
+            if data.size != int(w) * int(h):
+                raise ValueError('Data size mismatch')
+
+            raw = data.reshape((int(h), int(w))).astype(np.float32)
+
+            # keep original dimensions (before orientation correction)
+            self._orig_w = int(w)
+            self._orig_h = int(h)
+
+            # orientation correction (same as RAW loader)
+            if model in ORIENT_ROTATE_LEFT_FLIP_H_MODELS:
+                try:
+                    raw = np.rot90(raw, k=1)
+                    raw = np.fliplr(raw)
+                except Exception:
+                    pass
+
+            try:
+                raw = np.ascontiguousarray(raw)
+            except Exception:
+                pass
+
+            # Store separately so we don't wipe existing blemish/line results state
+            self.ctf_data = raw
+            try:
+                self.height = int(raw.shape[0])
+                self.width = int(raw.shape[1])
+            except Exception:
+                self.width = int(w)
+                self.height = int(h)
+            self.current_model = model
+
+            # directory bookkeeping
+            self.ctf_loaded_file_path = file_path
+            self.ctf_save_dir = os.path.dirname(file_path) if os.path.isdir(os.path.dirname(file_path)) else None
+            if self._open_default_dir:
+                self._open_default_dir = os.path.dirname(file_path) or self._open_default_dir
+
+            # show only in Raw preview
+            self._ensure_layers()
+            self._refresh_raw_layer()
+
+            self._set_status(f'Loaded CTF: {os.path.basename(file_path)}  (Wheel click 2 points to define a line)')
+
+        except Exception as e:
+            show_err(self, 'Load Error', str(e))
+
+    def _on_raw_click_for_ctf(self, viewer: Any, event: Any) -> None:
+        """In CTF mode, wheel click twice to define a line."""
+        try:
+            if not getattr(self, '_ctf_mode', False):
+                return
+            img = getattr(self, 'ctf_data', None)
+            if img is None:
+                return
+            if _shift_pressed(event):
+                return
+            if not _middle_button(event):
+                return
+        except Exception:
+            return
+
+        p = getattr(event, 'position', None)
+        if p is None:
+            return
+        try:
+            y = int(round(float(p[-2])))
+            x = int(round(float(p[-1])))
+        except Exception:
+            return
+        try:
+            h, w = img.shape[:2]
+            y = max(0, min(int(h) - 1, y))
+            x = max(0, min(int(w) - 1, x))
+        except Exception:
+            pass
+        self._ctf_add_point(y, x)
+        try:
+            event.handled = True
+        except Exception:
+            pass
+
+    def _ctf_add_point(self, y: int, x: int) -> None:
+        self._ensure_layers()
+        try:
+            if len(self._ctf_points) >= 2:
+                self._ctf_points = []
+            self._ctf_points.append((int(y), int(x)))
+        except Exception:
+            return
+
+        # update overlays
+        try:
+            if self.layer_ctf_points is not None:
+                pts = np.array([[yy, xx] for (yy, xx) in self._ctf_points], dtype=np.float32)
+                self.layer_ctf_points.data = pts
+        except Exception:
+            pass
+        try:
+            if self.layer_ctf_line is not None:
+                if len(self._ctf_points) == 2:
+                    (y1, x1), (y2, x2) = self._ctf_points
+                    self.layer_ctf_line.data = [np.array([[y1, x1], [y2, x2]], dtype=np.float32)]
+                else:
+                    self.layer_ctf_line.data = []
+        except Exception:
+            pass
+
+        try:
+            if len(self._ctf_points) == 1:
+                self._set_status('CTF: select the 2nd point (Wheel click)')
+            elif len(self._ctf_points) == 2:
+                self._set_status('CTF: line ready. Press the CTF button to compute.')
+        except Exception:
+            pass
+
+    def _ctf_bresenham_profile(self, img: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> np.ndarray:
+        """Sample pixel values along the line using Bresenham algorithm."""
+        try:
+            h, w = img.shape[:2]
+        except Exception:
+            return np.array([], dtype=np.float32)
+        x0 = int(x0); y0 = int(y0); x1 = int(x1); y1 = int(y1)
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        out = []
+        while True:
+            if 0 <= y0 < h and 0 <= x0 < w:
+                out.append(float(img[y0, x0]))
+            else:
+                out.append(float('nan'))
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+        return np.asarray(out, dtype=np.float32)
+
+    def _on_ctf(self) -> None:
+        """Run CTF(1/2/3 lp/mm) analysis using the selected line."""
+        if not getattr(self, '_ctf_mode', False):
+            show_info(self, 'CTF', 'Please load a CTF image first (Load CTF).')
+            return
+        img = getattr(self, 'ctf_data', None)
+        if img is None:
+            show_err(self, 'CTF', 'No CTF image loaded.')
+            return
+        if len(getattr(self, '_ctf_points', [])) != 2:
+            show_info(self, 'CTF', 'Wheel click 2 points on the Raw preview to define a line.')
+            return
+
+        (y1, x1), (y2, x2) = self._ctf_points
+        prof = self._ctf_bresenham_profile(img, x1, y1, x2, y2)
+        if prof.size < 10:
+            show_err(self, 'CTF', 'Line is too short to analyze.')
+            return
+        self._ctf_last_profile = prof.copy()
+
+        # Interactive range selection (SpanSelector)
+        # CTF range (lp/mm): default 2, can be 2~4 via params
+        try:
+            max_lp = int(getattr(self, "blemish_params", {}).get("ctf_range", 2))
+        except Exception:
+            max_lp = 2
+        max_lp = max(2, min(4, max_lp))
+
+        # Range selection (SpanSelector): 1lp는 절대값, 그 외는 1lp 대비 정규화
+        steps: List[Tuple[str, str]] = [('1lp', 'MAX'), ('1lp', 'MIN')]
+        for _lp in range(2, max_lp + 1):
+            steps.append((f'{_lp}lp', 'MAX'))
+            steps.append((f'{_lp}lp', 'MIN'))
+        state = {'step': 0, 'results': {}, 'markers': []}
+
+
+        fig, ax = plt.subplots(num='CTF Range Select', figsize=(9, 4))
+        self._ctf_select_fig = fig
+        x = np.arange(prof.size, dtype=np.int32)
+        ax.plot(x, prof, linewidth=1.0)
+        ax.set_xlabel('Index')
+        ax.set_ylabel('DN')
+        ax.set_title('Drag to select range: 1lp MAX')
+        ax.grid(True, alpha=0.2)
+
+        def _update_title():
+            try:
+                lp, mm = steps[state['step']]
+                ax.set_title(f'Drag to select range: {lp} {mm}')
+                fig.canvas.draw_idle()
+            except Exception:
+                pass
+
+        def _onselect(xmin, xmax):
+            try:
+                if state['step'] >= len(steps):
+                    return
+                a = int(round(min(xmin, xmax)))
+                b = int(round(max(xmin, xmax)))
+                a = max(0, min(int(prof.size) - 1, a))
+                b = max(0, min(int(prof.size) - 1, b))
+                if b <= a:
+                    return
+                lp, mm = steps[state['step']]
+                seg = prof[a:b+1]
+                if mm == 'MAX':
+                    val = float(np.nanmax(seg))
+                    idx = int(a + int(np.nanargmax(seg)))
+                else:
+                    val = float(np.nanmin(seg))
+                    idx = int(a + int(np.nanargmin(seg)))
+
+                state['results'].setdefault(lp, {})[mm] = {'val': val, 'idx': idx, 'range': (a, b)}
+                # visualize selection
+                try:
+                    # 선택 범위가 다음 선택에 거슬리지 않도록, 범위(Span) 표시만 숨기고 마커는 남김
+                    try:
+                        # matplotlib 버전별로 selection artist 접근 방식이 다름
+                        if hasattr(selector, "artists"):
+                            for _a in list(selector.artists):
+                                try:
+                                    _a.set_visible(False)
+                                except Exception:
+                                    pass
+                        if hasattr(selector, "rect") and selector.rect is not None:
+                            try:
+                                selector.rect.set_visible(False)
+                            except Exception:
+                                pass
+                        try:
+                            fig.canvas.draw_idle()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+                try:
+                    mk = ax.scatter([idx], [val], s=30)
+                    state['markers'].append(mk)
+                except Exception:
+                    pass
+
+                state['step'] += 1
+                if state['step'] >= len(steps):
+                    try:
+                        selector.disconnect_events()
+                    except Exception:
+                        pass
+                    try:
+                        self._ctf_span_selector = None
+                    except Exception:
+                        pass
+                    try:
+                        plt.close(fig)
+                    except Exception:
+                        pass
+                    self._ctf_select_fig = None
+                    self._ctf_finalize_ctf(state['results'])
+                    return
+                _update_title()
+            except Exception as e:
+                show_err(self, 'CTF', str(e))
+
+        selector = SpanSelector(ax, _onselect, 'horizontal', useblit=False, interactive=False)
+        self._ctf_span_selector = selector
+        _update_title()
+        try:
+            fig.show()
+        except Exception:
+            try:
+                plt.show()
+            except Exception:
+                pass
+
+    def _ctf_finalize_ctf(self, results: Dict[str, Dict[str, Dict[str, Any]]]) -> None:
+        """Compute and show/save CTF output after ranges are selected."""
+        try:
+            # ---------------------------
+            # CTF range (lp/mm): 2~4, default 2
+            # ---------------------------
+            try:
+                max_lp = int(getattr(self, "blemish_params", {}).get("ctf_range", 2))
+            except Exception:
+                max_lp = 2
+            max_lp = max(2, min(4, max_lp))
+
+            # Extract max/min + profile index for each lp
+            def _get(lp_key: str, k: str, field: str = 'val') -> float:
+                try:
+                    return float(results.get(lp_key, {}).get(k, {}).get(field, float('nan')))
+                except Exception:
+                    return float('nan')
+
+            max_v: Dict[int, float] = {}
+            min_v: Dict[int, float] = {}
+            frac: Dict[int, float] = {}
+            ctf: Dict[int, float] = {}
+            idx_map: Dict[Tuple[int, str], int] = {}
+
+            for lp in range(1, max_lp + 1):
+                lp_key = f"{lp}lp"
+                mx = _get(lp_key, 'MAX', 'val')
+                mn = _get(lp_key, 'MIN', 'val')
+                max_v[lp] = mx
+                min_v[lp] = mn
+                try:
+                    idx_map[(lp, 'MAX')] = int(_get(lp_key, 'MAX', 'idx'))
+                except Exception:
+                    pass
+                try:
+                    idx_map[(lp, 'MIN')] = int(_get(lp_key, 'MIN', 'idx'))
+                except Exception:
+                    pass
+
+                denom = (mx + mn)
+                if np.isfinite(mx) and np.isfinite(mn) and denom != 0:
+                    frac[lp] = float((mx - mn) / denom)
+                else:
+                    frac[lp] = float('nan')
+
+            frac1 = frac.get(1, float('nan'))
+            # CTF 값: 1lp는 (mx-mn)/(mx+mn)*100, 2lp~는 1lp 대비 정규화
+            for lp in range(1, max_lp + 1):
+                if lp == 1:
+                    ctf[lp] = float(frac.get(1, float('nan')) * 100.0) if np.isfinite(frac.get(1, float('nan'))) else float('nan')
+                else:
+                    if np.isfinite(frac.get(lp, float('nan'))) and np.isfinite(frac1) and frac1 != 0:
+                        ctf[lp] = float((frac[lp] / frac1) * 100.0)
+                    else:
+                        ctf[lp] = float('nan')
+
+            # ---------------------------
+            # White mean (전체/ROI) : Load Raw에서 불러온 white_data 사용
+            # ---------------------------
+            white_full_mean = None
+            white_roi_mean = None
+            try:
+                if getattr(self, 'white_data', None) is not None:
+                    white_full_mean = float(np.nanmean(self.white_data))
+            except Exception:
+                white_full_mean = None
+
+            try:
+                wimg = getattr(self, 'white_data', None)
+                if wimg is not None:
+                    try:
+                        model = self.cb_model.currentText()
+                    except Exception:
+                        model = ""
+                    p = getattr(self, "blemish_params", {}) or {}
+                    rx = int(p.get("ctf_roi_x", 0))
+                    ry = int(p.get("ctf_roi_y", 0))
+                    rw = int(p.get("ctf_roi_w", 0))
+                    rh = int(p.get("ctf_roi_h", 0))
+                    if rw <= 0 or rh <= 0:
+                        # 안전장치: 모델 기본 ROI로 대체
+                        try:
+                            ow, oh = MODEL_DIMENSIONS.get(model, {}).get("Probe", (0, 0))
+                            preset = ROI_PRESETS_XY.get(model)
+                            if preset is not None and ow and oh:
+                                (x1, y1), (x2, y2) = preset
+                                x1, y1, x2, y2 = orient_transform_box_xy(model, x1, y1, x2, y2, ow, oh)
+                                rx, ry, rw, rh = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
+                            else:
+                                rx, ry, rw, rh = 0, 0, int(wimg.shape[1]), int(wimg.shape[0])
+                        except Exception:
+                            rx, ry, rw, rh = 0, 0, int(wimg.shape[1]), int(wimg.shape[0])
+
+                    # clamp
+                    rx = max(0, min(int(wimg.shape[1]), int(rx)))
+                    ry = max(0, min(int(wimg.shape[0]), int(ry)))
+                    rw = max(0, int(rw))
+                    rh = max(0, int(rh))
+                    x2 = max(rx, min(int(wimg.shape[1]), int(rx + rw)))
+                    y2 = max(ry, min(int(wimg.shape[0]), int(ry + rh)))
+                    if x2 > rx and y2 > ry:
+                        white_roi_mean = float(np.nanmean(wimg[ry:y2, rx:x2]))
+            except Exception:
+                white_roi_mean = None
+
+            # ---------------------------
+            # Output text (ctf(3lp).py 스타일 유지)
+            # ---------------------------
+            lines: List[str] = []
+            header = "lp/mm\tMAX\tMIN\t(MAX-MIN)/(MAX+MIN)\tCTF"
+            if white_roi_mean is not None:
+                header += "\tWhite ROI Mean"
+            lines.append(header)
+
+            def _fmt_row(lp: int) -> str:
+                mx = max_v.get(lp, float('nan'))
+                mn = min_v.get(lp, float('nan'))
+                fr = frac.get(lp, float('nan'))
+                frac_percent = (fr * 100.0) if np.isfinite(fr) else float('nan')
+                ctf_val = ctf.get(lp, float('nan'))
+                mx_i = int(mx) if np.isfinite(mx) else 0
+                mn_i = int(mn) if np.isfinite(mn) else 0
+                s = f"{lp}\t{mx_i}\t{mn_i}\t{frac_percent:.1f}%\t{ctf_val:.1f}%"
+                if white_roi_mean is not None:
+                    s += f"\t{int(white_roi_mean)}"
+                return s
+
+            for lp in range(1, max_lp + 1):
+                lines.append(_fmt_row(lp))
+
+            # summary line (CTF 2~N + sensitivities)
+            lines.append("")
+            summary_cols = [f"CTF({lp}lp)" for lp in range(2, max_lp + 1)] + ["전체 감도", "ROI 감도"]
+            lines.append("\t".join(summary_cols))
+
+            summary_vals: List[str] = []
+            for lp in range(2, max_lp + 1):
+                v = ctf.get(lp, float('nan'))
+                summary_vals.append(f"{v:.1f}%" if np.isfinite(v) else "미설정")
+
+            summary_vals.append(f"{int(white_full_mean)}" if white_full_mean is not None else "미설정")
+            summary_vals.append(f"{int(white_roi_mean)}" if white_roi_mean is not None else "미설정")
+            lines.append("\t".join(summary_vals))
+
+            output_str = "\n".join(lines)
+
+            # auto-save next to loaded CTF image, if possible
+            save_dir = self.ctf_save_dir or os.getcwd()
+            try:
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                save_path = os.path.join(save_dir, f'ctf_result_{ts}.txt')
+                with open(save_path, 'w', encoding='utf-8') as f:
+                    f.write(output_str)
+            except Exception:
+                save_path = None
+
+            try:
+                QApplication.clipboard().setText(output_str)
+            except Exception:
+                pass
+
+            # ---------------------------
+            # Result plot (중복/겹침 방지: pyplot num 재사용 금지)
+            # ---------------------------
+            try:
+                if getattr(self, '_ctf_result_fig', None) is not None:
+                    self._ctf_result_fig = None
+            except Exception:
+                pass
+
+            fig2 = Figure(figsize=(9, 4))
+            self._ctf_result_fig = fig2
+            ax2 = fig2.add_subplot(111)
+            prof = self._ctf_last_profile if self._ctf_last_profile is not None else np.array([], dtype=np.float32)
+            x = np.arange(prof.size) if prof.size else np.arange(1)
+            if prof.size:
+                ax2.plot(x, prof, linewidth=1.0)
+            ax2.set_xlabel('Index')
+            ax2.set_ylabel('DN')
+            ax2.set_title('CTF Result (profile + selected MAX/MIN)')
+            ax2.grid(True, alpha=0.2)
+
+            def _mark(lp: int, mm: str, marker: str):
+                try:
+                    idx = idx_map.get((lp, mm), None)
+                    if idx is None:
+                        return
+                    idx = int(idx)
+                    if prof.size and 0 <= idx < prof.size:
+                        val = float(prof[idx])
+                        if np.isfinite(val):
+                            ax2.scatter([idx], [val], s=40, marker=marker)
+                except Exception:
+                    pass
+
+            for lp in range(1, max_lp + 1):
+                _mark(lp, 'MAX', 'o')
+                _mark(lp, 'MIN', 'x')
+
+            try:
+                fig2.tight_layout()
+            except Exception:
+                pass
+
+            # show dialog with text + embedded fig2 if possible
+            try:
+                if self._ctf_result_dialog is not None:
+                    self._ctf_result_dialog.close()
+            except Exception:
+                pass
+            self._ctf_result_dialog = CTFResultDialog(self, output_str, fig=fig2, default_dir=save_dir)
+            try:
+                self._ctf_result_dialog.show()
+            except Exception:
+                self._ctf_result_dialog.exec_()
+
+            if save_path:
+                self._set_status(f'CTF done. Saved: {os.path.basename(save_path)} (copied to clipboard)')
+            else:
+                self._set_status('CTF done. (copied to clipboard)')
+        except Exception as e:
+            show_err(self, 'CTF', str(e))
+
+
     def _on_load_clicked(self) -> None:
         model = self.cb_model.currentText()
         typ = self.cb_type.currentText()
+        # RAW load disables CTF mode
+        self._ctf_mode = False
+        self.ctf_loaded_file_path = None
+        self.ctf_data = None
+        self.ctf_save_dir = None
+        self._clear_ctf_layers()
         # ensure blemish params match selected model/type profile
         self._load_profile_params_for_current_selection()
         w, h = MODEL_DIMENSIONS.get(model, {}).get(typ, (None, None))
@@ -2907,7 +3913,16 @@ class XrayNapariWidget(QSplitter):
                 pass
 
             self.raw_data = raw
-            self.processed_data = None
+            # keep a copy as White(reference) image for CTF mean reporting
+            try:
+                self.white_data = raw
+                self.white_loaded_file_path = file_path
+            except Exception:
+                pass
+            try:
+                self.btn_load_ctf.setEnabled(True)
+            except Exception:
+                pass
             # 변환 후 실제 크기를 기준으로 width/height 갱신
             try:
                 self.height = int(raw.shape[0])
@@ -3281,11 +4296,20 @@ class XrayNapariWidget(QSplitter):
     # ---------------------------
 
     def _refresh_raw_layer(self) -> None:
-        if self.raw_data is None:
+        img = None
+        try:
+            if getattr(self, '_ctf_mode', False) and getattr(self, 'ctf_data', None) is not None:
+                img = self.ctf_data
+            else:
+                img = self.raw_data
+        except Exception:
+            img = self.raw_data
+
+        if img is None:
             return
         self._ensure_layers()
-        self.layer_raw.data = self.raw_data
-        self.layer_raw.contrast_limits = percentile_clim(self.raw_data, roi_bounds=self.roi_bounds)
+        self.layer_raw.data = img
+        self.layer_raw.contrast_limits = percentile_clim(img, roi_bounds=self.roi_bounds)
 
     def _refresh_result_layer(self) -> None:
         if self.processed_data is None:
