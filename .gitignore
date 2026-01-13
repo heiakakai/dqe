@@ -1,3 +1,4 @@
 dist/
 build/
 *.spec
+dqe_v15_patched_v24_line_detect.py
