@@ -42,7 +42,7 @@
             }
         },
         "1616|Probe": {
-            "saved_at": "2026-01-13T16:25:24+09:00",
+            "saved_at": "2026-01-14T11:26:54+09:00",
             "params": {
                 "analysis_scope": "ROI",
                 "use_roi_as_reference": true,
@@ -57,7 +57,7 @@
                 "border_margin": 3,
                 "max_detections": 20,
                 "min_dn": 1,
-                "min_circularity": 0.55,
+                "min_circularity": 0.45,
                 "max_eccentricity": 0.95,
                 "overlay_bottom_margin_px": 9,
                 "line_drop_ratio": 0.9,

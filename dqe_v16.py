@@ -1806,7 +1806,7 @@ class XrayNapariWidget(QSplitter):
         self.right_panel = self._build_right_panel()
         # 표/라벨이 가로로 잘리지 않게 최소 폭 확보
         try:
-            self.right_panel.setMinimumWidth(520)
+            self.right_panel.setMinimumWidth(400)
         except Exception:
             pass
 
@@ -2255,16 +2255,16 @@ class XrayNapariWidget(QSplitter):
         self.btn_save_crop.clicked.connect(self._on_save_crop)
         self.btn_param.clicked.connect(self._on_param)
 
-        # ---- table (요청: (X,Y)/Thr(%)/CropΔ%/Area(px^2))
+        # ---- table (요청: (X,Y)/Thr%/Crop%/Area)
         self.tbl = QTableWidget(0, 4)
-        self.tbl.setHorizontalHeaderLabels(["(X,Y)", "Thr(%)", "CropΔ%", "Area(px^2)"])
+        self.tbl.setHorizontalHeaderLabels(["(X,Y)", "Thr%", "Crop%", "Area"])
         self.tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.tbl.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.tbl.cellClicked.connect(self._on_table_clicked)
         self.tbl.setMinimumHeight(280)
         # 가로 잘림 방지(패널 폭이 좁아질 때 최소 폭 확보)
         try:
-            self.tbl.setMinimumWidth(460)
+            self.tbl.setMinimumWidth(350)
         except Exception:
             pass
 
