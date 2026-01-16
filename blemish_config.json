@@ -42,7 +42,7 @@
             }
         },
         "1616|Probe": {
-            "saved_at": "2026-01-14T11:26:54+09:00",
+            "saved_at": "2026-01-15T18:07:19+09:00",
             "params": {
                 "analysis_scope": "ROI",
                 "use_roi_as_reference": true,
@@ -57,7 +57,7 @@
                 "border_margin": 3,
                 "max_detections": 20,
                 "min_dn": 1,
-                "min_circularity": 0.45,
+                "min_circularity": 0.35,
                 "max_eccentricity": 0.95,
                 "overlay_bottom_margin_px": 9,
                 "line_drop_ratio": 0.9,
@@ -71,6 +71,38 @@
                 "ctf_roi_y": 2550,
                 "ctf_roi_w": 1000,
                 "ctf_roi_h": 1000
+            }
+        },
+        "1616dyn|Probe": {
+            "saved_at": "2026-01-15T17:50:55+09:00",
+            "params": {
+                "analysis_scope": "ROI",
+                "use_roi_as_reference": true,
+                "bg_window": 31,
+                "measure_window": 1,
+                "threshold_ref_percent_u": 25.0,
+                "threshold_ref_percent_l": 10.0,
+                "threshold_ref_percent": 25.0,
+                "threshold_crop_percent": 5.0,
+                "min_area": 5,
+                "max_area": 50000,
+                "border_margin": 3,
+                "max_detections": 20,
+                "min_dn": 1,
+                "min_circularity": 0.4,
+                "max_eccentricity": 0.95,
+                "overlay_bottom_margin_px": 9,
+                "line_drop_ratio": 0.9,
+                "line_frac_threshold": 0.05,
+                "line_exclude_x": "",
+                "line_exclude_y": "",
+                "line_ignore_margin_px": 8,
+                "line_break_jump_ratio": 0.5,
+                "ctf_range": 2,
+                "ctf_roi_x": 1,
+                "ctf_roi_y": 1,
+                "ctf_roi_w": 1643,
+                "ctf_roi_h": 1651
             }
         }
     },

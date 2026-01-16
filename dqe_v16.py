@@ -271,6 +271,7 @@ MODEL_DIMENSIONS: Dict[str, Dict[str, Tuple[Optional[int], Optional[int]]]] = {
     "1824": {"Probe": (3840, 3072), "PT": (3840, 3072), "MAP": (3840, 3072)},
     "1616": {"Probe": (3840, 3072), "PT": (1628, 1628), "MAP": (1628, 1628)},
     "1624": {"Probe": (3840, 3072), "PT": (3840, 3072), "MAP": (3840, 3072)},
+    "1616dyn": {"Probe": (1644, 1652)},
 }
 
 # ---------------------------
@@ -285,6 +286,7 @@ ROI_PRESETS_XY: Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]] = {
     "1616": ((0, 548), (1650, 2191)),
     "1824": ((1, 1), (2303, 3072)),
     "1624": ((0, 548), (2477, 2191)),
+    "1616dyn": ((1, 1), (1644, 1652)),
 }
 
 
@@ -300,6 +302,7 @@ RESULT_REDBOX_XY: Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]] = {
     "1824": ((11, 11), (2303, 3062)),
     "1616": ((17, 556), (1642, 2183)),
     "1624": ((24, 556), (2455, 2183)),
+    "1616dyn": ((11, 11), (1634, 1642)),
 }
 
 def estimate_pixel_pitch_cm(
@@ -1761,6 +1764,12 @@ class XrayNapariWidget(QSplitter):
         # White(Reference) image loaded via 'Load Raw' (used for sensitivity means in CTF output)
         self.white_data: Optional[np.ndarray] = None
         self.white_loaded_file_path: Optional[str] = None
+        self.db_mean_1616dyn: Optional[float] = None
+        self.db_avg_1616dyn: Optional[np.ndarray] = None
+        self.w_avg_1616dyn: Optional[np.ndarray] = None
+        self.is_showing_1616dyn_db: bool = False
+        self.db_roi_mean_1616dyn: Optional[float] = None
+        self.w_roi_mean_1616dyn: Optional[float] = None
 
 
 
@@ -3298,6 +3307,72 @@ class XrayNapariWidget(QSplitter):
             pass
         self._ctf_result_dialog = None
 
+    def _load_1616dyn_ctf_folder(self) -> None:
+        """Special handler for 1616dyn: load and average specific CTF images from a folder."""
+        model = '1616dyn'
+        typ = self.cb_type.currentText()
+        w, h = MODEL_DIMENSIONS.get(model, {}).get(typ, (None, None))
+        if w is None or h is None:
+            show_err(self, "Error", "1616dyn model has no fixed dimensions.")
+            return
+
+        self._ctf_mode = True
+        self._clear_ctf_layers()
+
+        dialog_dir = self._open_default_dir if os.path.isdir(self._open_default_dir) else ''
+        folder_path = QFileDialog.getExistingDirectory(self, 'Open 1616dyn CTF Folder', dialog_dir)
+        if not folder_path:
+            return
+
+        try:
+            w_files = sorted([f for f in os.listdir(folder_path) if f.lower().startswith('ctf_') and f.lower().endswith('.img')])
+            images_to_load = []
+            for fname in w_files:
+                match = re.search(r'ctf_.*_(\d{6})\.IMG$', fname, re.IGNORECASE)
+                if match:
+                    index = int(match.group(1))
+                    if 30 <= index <= 60:
+                        images_to_load.append(os.path.join(folder_path, fname))
+
+            if not images_to_load:
+                raise ValueError("No CTF images found in the specified range (30-60).")
+
+            size_bytes = int(w) * int(h) * 2
+            img_stack = []
+            for fpath in images_to_load:
+                fsz = os.path.getsize(fpath)
+                header = fsz - size_bytes
+                if header < 0: continue
+                with open(fpath, "rb") as fp:
+                    fp.seek(header)
+                    data = np.fromfile(fp, dtype=np.uint16, count=int(w) * int(h))
+                if data.size == int(w) * int(h):
+                    img_stack.append(data.reshape((int(h), int(w))))
+            
+            if not img_stack:
+                raise ValueError("Could not load any valid CTF images from the folder.")
+
+            raw = np.mean(img_stack, axis=0).astype(np.float32)
+            
+            self.ctf_data = np.ascontiguousarray(raw)
+            # Use the shape of the loaded data, which should match the model dimensions
+            self.height = int(self.ctf_data.shape[0])
+            self.width = int(self.ctf_data.shape[1])
+            self.current_model = model
+
+            self.ctf_loaded_file_path = folder_path
+            self.ctf_save_dir = folder_path
+            if folder_path:
+                self._open_default_dir = os.path.dirname(folder_path) or self._open_default_dir
+            
+            self._ensure_layers()
+            self._refresh_raw_layer()
+            self._set_status(f'Loaded CTF: {os.path.basename(folder_path)} (Indices 30-60 avg). Wheel click 2 points to define a line.')
+
+        except Exception as e:
+            show_err(self, 'Load Error', str(e))
+
+
     def _on_load_ctf_clicked(self) -> None:
         """Load a CTF image (.IMG/.raw) and display it in the Raw preview (left).
 
@@ -3313,6 +3388,11 @@ class XrayNapariWidget(QSplitter):
         if getattr(self, 'white_data', None) is None:
             show_info(self, 'CTF', 'Load Raw(White) image first. (Load CTF is enabled after Load Raw)')
             self._ctf_mode = False
+            return
+        
+        # Special handler for 1616dyn
+        if model == "1616dyn":
+            self._load_1616dyn_ctf_folder()
             return
 
         # enable CTF mode
@@ -3735,43 +3815,90 @@ class XrayNapariWidget(QSplitter):
                 white_roi_mean = None
 
             # ---------------------------
+            # ---------------------------
             # Output text (ctf(3lp).py 스타일 유지)
             # ---------------------------
             lines: List[str] = []
-            header = "lp/mm\tMAX\tMIN\t(MAX-MIN)/(MAX+MIN)\tCTF"
-            if white_roi_mean is not None:
-                header += "\tWhite ROI Mean"
-            lines.append(header)
+            if self.current_model == "1616dyn":
+                header = "lp/mm\tMAX\tMIN\t(MAX-MIN)/(MAX+MIN)\tCTF"
+                lines.append(header)
+                def _fmt_row_1616(lp: int) -> str:
+                    mx = max_v.get(lp, float('nan'))
+                    mn = min_v.get(lp, float('nan'))
+                    fr = frac.get(lp, float('nan'))
+                    frac_percent = (fr * 100.0) if np.isfinite(fr) else float('nan')
+                    ctf_val = ctf.get(lp, float('nan'))
+                    mx_i = int(mx) if np.isfinite(mx) else 0
+                    mn_i = int(mn) if np.isfinite(mn) else 0
+                    return f"{lp}\t{mx_i}\t{mn_i}\t{frac_percent:.1f}%\t{ctf_val:.1f}%"
+                for lp in range(1, max_lp + 1):
+                    lines.append(_fmt_row_1616(lp))
+                
+                lines.append("")
+                # Special summary for 1616dyn
+                ctf2lp = ctf.get(2, float('nan'))
+                db_mean = self.db_roi_mean_1616dyn
+                w_mean = self.w_roi_mean_1616dyn
+                
+                summary_cols = [f"CTF({lp}lp)" for lp in range(2, max_lp + 1)] + ["DB ROI Mean", "W ROI Mean"]
+                lines.append("\t".join(summary_cols))
 
-            def _fmt_row(lp: int) -> str:
-                mx = max_v.get(lp, float('nan'))
-                mn = min_v.get(lp, float('nan'))
-                fr = frac.get(lp, float('nan'))
-                frac_percent = (fr * 100.0) if np.isfinite(fr) else float('nan')
-                ctf_val = ctf.get(lp, float('nan'))
-                mx_i = int(mx) if np.isfinite(mx) else 0
-                mn_i = int(mn) if np.isfinite(mn) else 0
-                s = f"{lp}\t{mx_i}\t{mn_i}\t{frac_percent:.1f}%\t{ctf_val:.1f}%"
+                summary_vals: List[str] = []
+                for lp in range(2, max_lp + 1):
+                    v = ctf.get(lp, float('nan'))
+                    summary_vals.append(f"{v:.1f}%" if np.isfinite(v) else "미설정")
+                summary_vals.append(f"{int(db_mean)}" if db_mean is not None else "미설정")
+                summary_vals.append(f"{int(w_mean)}" if w_mean is not None else "미설정")
+                lines.append("\t".join(summary_vals))
+
+                lines.append("")
+                lines.append("--- Summary ---")
+                summary_line = f"{ctf2lp:.1f}%" if np.isfinite(ctf2lp) else "N/A"
+                summary_line += f" / {int(db_mean)}" if db_mean is not None else " / N/A"
+                summary_line += f" / {int(w_mean)}" if w_mean is not None else " / N/A"
+                lines.append(f"CTF(2lp) / DB ROI Mean / W ROI Mean: {summary_line}")
+
+            else:
+                # Original output for other models
+                header = "lp/mm\tMAX\tMIN\t(MAX-MIN)/(MAX+MIN)\tCTF"
                 if white_roi_mean is not None:
-                    s += f"\t{int(white_roi_mean)}"
-                return s
+                    header += "\tWhite ROI Mean"
+                if self.current_model == "1616dyn" and self.db_mean_1616dyn is not None:
+                    header += "\tDB Mean"
+                lines.append(header)
 
-            for lp in range(1, max_lp + 1):
-                lines.append(_fmt_row(lp))
+                def _fmt_row(lp: int) -> str:
+                    mx = max_v.get(lp, float('nan'))
+                    mn = min_v.get(lp, float('nan'))
+                    fr = frac.get(lp, float('nan'))
+                    frac_percent = (fr * 100.0) if np.isfinite(fr) else float('nan')
+                    ctf_val = ctf.get(lp, float('nan'))
+                    mx_i = int(mx) if np.isfinite(mx) else 0
+                    mn_i = int(mn) if np.isfinite(mn) else 0
+                    s = f"{lp}\t{mx_i}\t{mn_i}\t{frac_percent:.1f}%\t{ctf_val:.1f}%"
+                    if white_roi_mean is not None:
+                        s += f"\t{int(white_roi_mean)}"
+                    # This part is now handled by the 1616dyn specific block above
+                    # if self.current_model == "1616dyn" and self.db_mean_1616dyn is not None:
+                    #     s += f"\t{int(self.db_mean_1616dyn)}"
+                    return s
 
-            # summary line (CTF 2~N + sensitivities)
-            lines.append("")
-            summary_cols = [f"CTF({lp}lp)" for lp in range(2, max_lp + 1)] + ["전체 감도", "ROI 감도"]
-            lines.append("\t".join(summary_cols))
+                for lp in range(1, max_lp + 1):
+                    lines.append(_fmt_row(lp))
 
-            summary_vals: List[str] = []
-            for lp in range(2, max_lp + 1):
-                v = ctf.get(lp, float('nan'))
-                summary_vals.append(f"{v:.1f}%" if np.isfinite(v) else "미설정")
+                # summary line (CTF 2~N + sensitivities)
+                lines.append("")
+                summary_cols = [f"CTF({lp}lp)" for lp in range(2, max_lp + 1)] + ["전체 감도", "ROI 감도"]
+                lines.append("\t".join(summary_cols))
 
-            summary_vals.append(f"{int(white_full_mean)}" if white_full_mean is not None else "미설정")
-            summary_vals.append(f"{int(white_roi_mean)}" if white_roi_mean is not None else "미설정")
-            lines.append("\t".join(summary_vals))
+                summary_vals: List[str] = []
+                for lp in range(2, max_lp + 1):
+                    v = ctf.get(lp, float('nan'))
+                    summary_vals.append(f"{v:.1f}%" if np.isfinite(v) else "미설정")
+
+                summary_vals.append(f"{int(white_full_mean)}" if white_full_mean is not None else "미설정")
+                summary_vals.append(f"{int(white_roi_mean)}" if white_roi_mean is not None else "미설정")
+                lines.append("\t".join(summary_vals))
 
             output_str = "\n".join(lines)
 
@@ -3853,9 +3980,147 @@ class XrayNapariWidget(QSplitter):
             show_err(self, 'CTF', str(e))
 
 
+
+    def _load_1616dyn_raw_folder(self) -> None:
+        """Special handler for 1616dyn: load DB folder, then W folder."""
+        # Reset CTF state first
+        self._ctf_mode = False
+        self.ctf_loaded_file_path = None
+        self.ctf_data = None
+        self.ctf_save_dir = None
+        self._clear_ctf_layers()
+
+        model = '1616dyn'
+        typ = self.cb_type.currentText()
+        w, h = MODEL_DIMENSIONS.get(model, {}).get(typ, (None, None))
+        if w is None or h is None:
+            show_err(self, "Error", "1616dyn model has no fixed dimensions.")
+            return
+
+        # --- Reset state ---
+        self.db_mean_1616dyn = None
+        self.db_avg_1616dyn = None
+        self.w_avg_1616dyn = None
+        
+        try:
+            # --- 1. Load DB Folder ---
+            show_info(self, "Folder Selection", "DB폴더를 선택해주세요")
+            dialog_dir = self._open_default_dir if os.path.isdir(self._open_default_dir) else ""
+            db_folder_path = QFileDialog.getExistingDirectory(self, "1. Select DB Folder", dialog_dir)
+            if not db_folder_path:
+                return # User cancelled
+
+            db_files = [os.path.join(db_folder_path, f) for f in os.listdir(db_folder_path) if f.lower().endswith('.img')]
+            if not db_files:
+                raise ValueError("No .IMG files found in the selected DB folder.")
+
+            size_bytes = int(w) * int(h) * 2
+            db_stack = []
+            for fpath in db_files:
+                fsz = os.path.getsize(fpath)
+                header = fsz - size_bytes
+                if header < 0: continue
+                with open(fpath, "rb") as fp:
+                    fp.seek(header)
+                    data = np.fromfile(fp, dtype=np.uint16, count=int(w) * int(h))
+                if data.size == int(w) * int(h):
+                    db_stack.append(data.reshape((int(h), int(w))))
+            
+            if not db_stack:
+                raise ValueError("Could not load any valid .IMG files from the DB folder.")
+
+            db_avg_raw = np.mean(db_stack, axis=0).astype(np.float32)
+            self.db_mean_1616dyn = float(np.mean(db_avg_raw))
+            
+            # --- 2. Load W Folder ---
+            show_info(self, "Folder Selection", "W폴더를 선택해주세요")
+            dialog_dir = self._open_default_dir # Start from the same location
+            w_folder_path = QFileDialog.getExistingDirectory(self, "2. Select W Folder", dialog_dir)
+            w_avg_raw = None
+            if w_folder_path: # W folder is optional
+                w_files = sorted([f for f in os.listdir(w_folder_path) if f.lower().startswith('w_')])
+                w_images_to_load = []
+                for fname in w_files:
+                    match = re.search(r'w_.*_(\d{6})\.IMG$', fname, re.IGNORECASE)
+                    if match:
+                        index = int(match.group(1))
+                        if 30 <= index <= 60:
+                            w_images_to_load.append(os.path.join(w_folder_path, fname))
+                
+                if w_images_to_load:
+                    w_stack = []
+                    for fpath in w_images_to_load:
+                        fsz = os.path.getsize(fpath)
+                        header = fsz - size_bytes
+                        if header < 0: continue
+                        with open(fpath, "rb") as fp:
+                            fp.seek(header)
+                            data = np.fromfile(fp, dtype=np.uint16, count=int(w) * int(h))
+                        if data.size == int(w) * int(h):
+                            w_stack.append(data.reshape((int(h), int(w))))
+                    if w_stack:
+                        w_avg_raw = np.mean(w_stack, axis=0).astype(np.float32)
+                self._open_default_dir = os.path.dirname(w_folder_path) or self._open_default_dir
+
+            # --- Finalization (Show DB image) ---
+            self._orig_w = int(w)
+            self._orig_h = int(h)
+
+            # Apply orientation correction to both averages
+            self.db_avg_1616dyn = np.ascontiguousarray(np.rot90(db_avg_raw, k=1)) if model in ORIENT_ROTATE_LEFT_FLIP_H_MODELS else db_avg_raw
+            if model in ORIENT_ROTATE_LEFT_FLIP_H_MODELS:
+                self.db_avg_1616dyn = np.fliplr(self.db_avg_1616dyn)
+
+            if w_avg_raw is not None:
+                self.w_avg_1616dyn = np.ascontiguousarray(np.rot90(w_avg_raw, k=1)) if model in ORIENT_ROTATE_LEFT_FLIP_H_MODELS else w_avg_raw
+                if model in ORIENT_ROTATE_LEFT_FLIP_H_MODELS:
+                    self.w_avg_1616dyn = np.fliplr(self.w_avg_1616dyn)
+
+            self.raw_data = self.db_avg_1616dyn
+            self.white_data = self.raw_data 
+            self.white_loaded_file_path = db_folder_path
+            self.btn_load_ctf.setEnabled(True)
+            self.height = int(self.raw_data.shape[0])
+            self.width = int(self.raw_data.shape[1])
+            self.current_model = model
+            self.pixel_pitch_cm = estimate_pixel_pitch_cm(
+                model, img_w_px=self.width, img_h_px=self.height,
+                orig_w_px=self._orig_w, orig_h_px=self._orig_h
+            )
+            self.loaded_file_path = db_folder_path # Use DB folder as primary path
+            self._fit_after_load = True
+            self.blemish_save_dir = db_folder_path
+
+            self._ensure_layers()
+            self._clear_roi_and_blemish_layers()
+            self._refresh_raw_layer()
+            self._apply_fixed_roi_preset_on_load(model)
+            self._apply_process_and_refresh()
+            
+            # Calculate and store ROI means after ROI is set
+            if self.roi_bounds and self.roi_bounds.valid:
+                roi = self.roi_bounds
+                if self.db_avg_1616dyn is not None:
+                    self.db_roi_mean_1616dyn = float(np.mean(self.db_avg_1616dyn[roi.y1:roi.y2, roi.x1:roi.x2]))
+                if self.w_avg_1616dyn is not None:
+                    self.w_roi_mean_1616dyn = float(np.mean(self.w_avg_1616dyn[roi.y1:roi.y2, roi.x1:roi.x2]))
+
+            self.is_showing_1616dyn_db = True
+            self._set_status(f"Loaded DB and W data. Press Blemish to proceed.")
+
+        except Exception as e:
+            self._open_default_dir = ""
+            show_err(self, "Load Error", str(e))
+
     def _on_load_clicked(self) -> None:
         model = self.cb_model.currentText()
         typ = self.cb_type.currentText()
+        
+        # Special handler for 1616dyn
+        if model == "1616dyn":
+            self._load_1616dyn_raw_folder()
+            return
+
         # RAW load disables CTF mode
         self._ctf_mode = False
         self.ctf_loaded_file_path = None
@@ -4773,6 +5038,18 @@ class XrayNapariWidget(QSplitter):
     def _on_detect(self) -> None:
         if self.raw_data is None:
             return
+
+        # For 1616dyn, switch from DB to W image on first detect press
+        if self.current_model == "1616dyn" and self.is_showing_1616dyn_db:
+            if self.w_avg_1616dyn is not None:
+                self.raw_data = self.w_avg_1616dyn
+                self._apply_process_and_refresh()
+                self._set_status(f"Switched to W image for detection.")
+                self.is_showing_1616dyn_db = False # prevent switching again
+            else:
+                show_info(self, "Info", "W image data is not available.")
+                return
+
         tgt = self.cb_target.currentText()
         img = self.processed_data if (tgt == "Corrected" and self.processed_data is not None) else self.raw_data
         if img is None:
