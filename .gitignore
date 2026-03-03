@@ -1,4 +1,28 @@
-dist/
+# Python Virtual Environments
+venv/
+.venv/
+env/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
 build/
-*.spec
-dqe_v15_patched_v24_line_detect.py
+dist/
+*.egg-info/
+Output/
+
+# Log files
+*.log
+
+# Image 파일과 Txt 파일에 대한 예외처리
+*.image
+*.txt
+*.exe
+*.img
+old/dqe_v15_patched_v24_line_detect.py
+dqe_v16_installer.iss
+dqe_V1.iss

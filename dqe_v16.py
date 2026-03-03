@@ -11,14 +11,17 @@ X-ray Spot Tracer & Normalizer (napari edition)
   napari 버전 변화에 따라 일부 API가 바뀔 수 있습니다(완전히 배제 불가).
 
 실행
-    python xray_spot_tracer_napari.py
+    python dqe_v16.py
 
-필수 패키지(예시)
-    pip install "napari[all]" scipy superqt
-
-    - napari[all]  : napari + Qt + vispy + image IO 등
-    - scipy        : uniform_filter, label, find_objects, binary_erosion
-    - superqt      : (선택) qthrottled 유틸. 없으면 내부 타이머로 대체해도 됨.
+필수/선택 패키지:
+- 필수:
+    pip install "napari[all]" scipy
+- 선택 (GPU 가속):
+    pip install cupy-cuda11x  # 시스템의 CUDA 버전에 맞게 설치
+- 상세:
+    - napari[all]: napari 뷰어, Qt, vispy, 이미지 IO(Pillow, imageio) 등 대부분의 의존성 포함
+    - scipy: Blemish 검출 및 라인 노이즈 보정에 사용
+    - cupy: (선택) NVIDIA GPU 가속용. 없으면 CPU로 자동 전환됩니다.
 """
 
 from __future__ import annotations
@@ -38,6 +41,14 @@ import numpy as np
 from scipy.ndimage import uniform_filter, label as nd_label, find_objects, binary_erosion, binary_dilation
 # import datetime  # removed to avoid shadowing datetime class
 import matplotlib.pyplot as plt
+
+# GPU 가속(CuPy)을 위한 import 시도
+try:
+    import cupy as cp
+    from cupy.ndimage import uniform_filter as cp_uniform_filter
+    CUPY_AVAILABLE = True
+except ImportError:
+    CUPY_AVAILABLE = False
 from matplotlib.widgets import SpanSelector
 from matplotlib.figure import Figure
 try:
@@ -64,6 +75,7 @@ from qtpy.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -77,6 +89,37 @@ from qtpy.QtWidgets import (
     QDialog,
     QPlainTextEdit,
 )
+
+# -----------------------------------------------------------------------------
+# Fix for "Could not find the Qt platform plugin 'windows'" error
+# -----------------------------------------------------------------------------
+def _fix_qt_plugin_path() -> None:
+    import os
+    if os.name != 'nt':
+        return
+    
+    # If already set, skip
+    if os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH"):
+        return
+
+    # Try to find PyQt5/PyQt6/PySide2/PySide6 plugins directory containing platforms/qwindows.dll
+    libs = ["PyQt5", "PyQt6", "PySide2", "PySide6"]
+    for lib in libs:
+        try:
+            mod = __import__(lib)
+            base = os.path.dirname(mod.__file__)
+            # Check common paths: base/QtX/plugins or base/plugins
+            candidates = [os.path.join(base, "Qt5", "plugins"), os.path.join(base, "Qt6", "plugins"), os.path.join(base, "plugins")]
+            for p in candidates:
+                if os.path.exists(os.path.join(p, "platforms", "qwindows.dll")):
+                    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = p
+                    # Add to PATH as well for DLL loading
+                    os.environ["PATH"] = p + os.pathsep + os.environ["PATH"]
+                    return
+        except ImportError:
+            continue
+
+_fix_qt_plugin_path()
 
 # -----------------------------------------------------------------------------
 # Runtime fixes for frozen builds (PyInstaller) on Windows
@@ -272,6 +315,7 @@ MODEL_DIMENSIONS: Dict[str, Dict[str, Tuple[Optional[int], Optional[int]]]] = {
     "1616": {"Probe": (3840, 3072), "PT": (1628, 1628), "MAP": (1628, 1628)},
     "1624": {"Probe": (3840, 3072), "PT": (3840, 3072), "MAP": (3840, 3072)},
     "1616dyn": {"Probe": (1644, 1652)},
+    "1624dyn": {"Probe": (1628, 2432)},
 }
 
 # ---------------------------
@@ -286,7 +330,8 @@ ROI_PRESETS_XY: Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]] = {
     "1616": ((0, 548), (1650, 2191)),
     "1824": ((1, 1), (2303, 3072)),
     "1624": ((0, 548), (2477, 2191)),
-    "1616dyn": ((1, 1), (1644, 1652)),
+    "1616dyn": ((11, 11), (1634, 1642)),
+    "1624dyn": ((1, 1), (1628, 2432)),
 }
 
 
@@ -302,7 +347,8 @@ RESULT_REDBOX_XY: Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]] = {
     "1824": ((11, 11), (2303, 3062)),
     "1616": ((17, 556), (1642, 2183)),
     "1624": ((24, 556), (2455, 2183)),
-    "1616dyn": ((11, 11), (1634, 1642)),
+    "1616dyn": ((1, 1), (1644, 1652)),
+    "1624dyn": ((1, 1), (1628, 2432)),
 }
 
 def estimate_pixel_pitch_cm(
@@ -1223,17 +1269,47 @@ def detect_blemish_candidates(
     else:
         ref_mean = float(np.mean(img))
 
-    # core algorithm
-    mw = int(p["measure_window"])
-    if mw <= 1:
-        # uniform_filter(size=1)은 항등(결과 동일)이라 계산을 생략하여 속도를 개선합니다.
-        w_m = work
-    else:
-        w_m = uniform_filter(work, mw)
-    bg = uniform_filter(w_m, int(p["bg_window"]))
-    drop = np.abs(1 - w_m / (bg + 1e-6)) * 100.0
+    # --- Core Blemish Detection Algorithm ---
+    # GPU 가속을 우선 시도하고, 실패하거나 사용 불가능하면 CPU로 fallback
+    mask = None
+    drop = None
+    if CUPY_AVAILABLE:
+        try:
+            # --- GPU 가속 경로 (CuPy) ---
+            # 1. 데이터를 GPU 메모리로 복사
+            work_gpu = cp.asarray(work)
+    
+            # 2. GPU에서 uniform_filter 및 배열 연산 수행
+            mw = int(p["measure_window"])
+            if mw <= 1:
+                w_m_gpu = work_gpu
+            else:
+                w_m_gpu = cp_uniform_filter(work_gpu, mw)
+    
+            bg_gpu = cp_uniform_filter(w_m_gpu, int(p["bg_window"]))
+            drop_gpu = cp.abs(1 - w_m_gpu / (bg_gpu + 1e-6)) * 100.0
+            mask_gpu = (drop_gpu >= float(p["threshold_crop_percent"])) & (work_gpu > int(p["min_dn"]))
+    
+            # 3. 필요한 결과(mask, drop)만 CPU 메모리로 다시 가져옴
+            mask = mask_gpu.get()
+            drop = drop_gpu.get()
+    
+        except Exception:
+            # GPU 경로에서 에러 발생 시, 아래 CPU 경로를 타도록 mask, drop을 None으로 둡니다.
+            mask = None
+            drop = None
 
-    mask = (drop >= float(p["threshold_crop_percent"])) & (work > int(p["min_dn"]))
+    if mask is None:
+        # --- CPU 경로 (SciPy) ---
+        mw = int(p["measure_window"])
+        if mw <= 1:
+            # uniform_filter(size=1)은 항등(결과 동일)이라 계산을 생략하여 속도를 개선합니다.
+            w_m = work
+        else:
+            w_m = uniform_filter(work, mw)
+        bg = uniform_filter(w_m, int(p["bg_window"]))
+        drop = np.abs(1 - w_m / (bg + 1e-6)) * 100.0
+        mask = (drop >= float(p["threshold_crop_percent"])) & (work > int(p["min_dn"]))
 
     m = int(p["border_margin"])
     if m > 0:
@@ -2225,6 +2301,10 @@ class XrayNapariWidget(QSplitter):
         self.btn_load_ctf = QPushButton('Load CTF (.IMG/.raw)')
         self.btn_load_ctf.setEnabled(False)  # enabled after Load Raw
         gl.addWidget(self.btn_load_ctf)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        gl.addWidget(self.progress_bar)
 
         self.cb_model.currentTextChanged.connect(self._on_model_changed)
         self.cb_type.currentTextChanged.connect(self._on_type_changed)
@@ -3309,11 +3389,11 @@ class XrayNapariWidget(QSplitter):
 
     def _load_1616dyn_ctf_folder(self) -> None:
         """Special handler for 1616dyn: load and average specific CTF images from a folder."""
-        model = '1616dyn'
+        model = self.cb_model.currentText()
         typ = self.cb_type.currentText()
         w, h = MODEL_DIMENSIONS.get(model, {}).get(typ, (None, None))
         if w is None or h is None:
-            show_err(self, "Error", "1616dyn model has no fixed dimensions.")
+            show_err(self, "Error", f"{model} model has no fixed dimensions.")
             return
 
         self._ctf_mode = True
@@ -3323,7 +3403,6 @@ class XrayNapariWidget(QSplitter):
         folder_path = QFileDialog.getExistingDirectory(self, 'Open 1616dyn CTF Folder', dialog_dir)
         if not folder_path:
             return
-
         try:
             w_files = sorted([f for f in os.listdir(folder_path) if f.lower().startswith('ctf_') and f.lower().endswith('.img')])
             images_to_load = []
@@ -3337,40 +3416,52 @@ class XrayNapariWidget(QSplitter):
             if not images_to_load:
                 raise ValueError("No CTF images found in the specified range (30-60).")
 
+            self.progress_bar.setRange(0, len(images_to_load))
+            self.progress_bar.setValue(0)
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setFormat("Loading CTF... %p%")
+            QApplication.processEvents()
+
             size_bytes = int(w) * int(h) * 2
-            img_stack = []
-            for fpath in images_to_load:
+            sum_img = np.zeros((int(h), int(w)), dtype=np.float64)
+            count = 0
+            for i, fpath in enumerate(images_to_load):
                 fsz = os.path.getsize(fpath)
-                header = fsz - size_bytes
-                if header < 0: continue
+                header = fsz - size_bytes 
+                if header < 0: continue 
                 with open(fpath, "rb") as fp:
                     fp.seek(header)
                     data = np.fromfile(fp, dtype=np.uint16, count=int(w) * int(h))
-                if data.size == int(w) * int(h):
-                    img_stack.append(data.reshape((int(h), int(w))))
-            
-            if not img_stack:
+                if data.size == int(w) * int(h): 
+                    sum_img += data.reshape((int(h), int(w)))
+                    count += 1
+                if i % 10 == 0 or i == len(images_to_load) - 1:
+                    self.progress_bar.setValue(i + 1)
+                    QApplication.processEvents()
+
+            if count == 0:
                 raise ValueError("Could not load any valid CTF images from the folder.")
 
-            raw = np.mean(img_stack, axis=0).astype(np.float32)
+            self.progress_bar.setFormat("Averaging...")
+            QApplication.processEvents()
+            raw = (sum_img / count).astype(np.float32)
             
             self.ctf_data = np.ascontiguousarray(raw)
-            # Use the shape of the loaded data, which should match the model dimensions
             self.height = int(self.ctf_data.shape[0])
             self.width = int(self.ctf_data.shape[1])
             self.current_model = model
-
             self.ctf_loaded_file_path = folder_path
             self.ctf_save_dir = folder_path
             if folder_path:
                 self._open_default_dir = os.path.dirname(folder_path) or self._open_default_dir
-            
             self._ensure_layers()
             self._refresh_raw_layer()
             self._set_status(f'Loaded CTF: {os.path.basename(folder_path)} (Indices 30-60 avg). Wheel click 2 points to define a line.')
-
         except Exception as e:
             show_err(self, 'Load Error', str(e))
+        finally:
+            self.progress_bar.setVisible(False)
+            self.progress_bar.setFormat("%p%")
 
 
     def _on_load_ctf_clicked(self) -> None:
@@ -3391,7 +3482,7 @@ class XrayNapariWidget(QSplitter):
             return
         
         # Special handler for 1616dyn
-        if model == "1616dyn":
+        if model in ("1616dyn", "1624dyn"):
             self._load_1616dyn_ctf_folder()
             return
 
@@ -3819,7 +3910,7 @@ class XrayNapariWidget(QSplitter):
             # Output text (ctf(3lp).py 스타일 유지)
             # ---------------------------
             lines: List[str] = []
-            if self.current_model == "1616dyn":
+            if self.current_model in ("1616dyn", "1624dyn"):
                 header = "lp/mm\tMAX\tMIN\t(MAX-MIN)/(MAX+MIN)\tCTF"
                 lines.append(header)
                 def _fmt_row_1616(lp: int) -> str:
@@ -3853,17 +3944,19 @@ class XrayNapariWidget(QSplitter):
 
                 lines.append("")
                 lines.append("--- Summary ---")
-                summary_line = f"{ctf2lp:.1f}%" if np.isfinite(ctf2lp) else "N/A"
-                summary_line += f" / {int(db_mean)}" if db_mean is not None else " / N/A"
-                summary_line += f" / {int(w_mean)}" if w_mean is not None else " / N/A"
-                lines.append(f"CTF(2lp) / DB ROI Mean / W ROI Mean: {summary_line}")
+                ctf2lp_str = f"{ctf2lp:.1f}%" if np.isfinite(ctf2lp) else "N/A"
+                db_mean_str = f"{int(db_mean)}" if db_mean is not None else "N/A"
+                w_mean_str = f"{int(w_mean)}" if w_mean is not None else "N/A"
+                lines.append(f"CTF(2lp)\t{ctf2lp_str}")
+                lines.append(f"DB ROI Mean\t{db_mean_str}")
+                lines.append(f"W ROI Mean\t{w_mean_str}")
 
             else:
                 # Original output for other models
                 header = "lp/mm\tMAX\tMIN\t(MAX-MIN)/(MAX+MIN)\tCTF"
                 if white_roi_mean is not None:
                     header += "\tWhite ROI Mean"
-                if self.current_model == "1616dyn" and self.db_mean_1616dyn is not None:
+                if self.current_model in ("1616dyn", "1624dyn") and self.db_mean_1616dyn is not None:
                     header += "\tDB Mean"
                 lines.append(header)
 
@@ -3912,10 +4005,10 @@ class XrayNapariWidget(QSplitter):
             except Exception:
                 save_path = None
 
-            try:
-                QApplication.clipboard().setText(output_str)
-            except Exception:
-                pass
+            # try:
+            #     QApplication.clipboard().setText(output_str)
+            # except Exception:
+            #     pass
 
             # ---------------------------
             # Result plot (중복/겹침 방지: pyplot num 재사용 금지)
@@ -3990,11 +4083,11 @@ class XrayNapariWidget(QSplitter):
         self.ctf_save_dir = None
         self._clear_ctf_layers()
 
-        model = '1616dyn'
+        model = self.cb_model.currentText()
         typ = self.cb_type.currentText()
         w, h = MODEL_DIMENSIONS.get(model, {}).get(typ, (None, None))
         if w is None or h is None:
-            show_err(self, "Error", "1616dyn model has no fixed dimensions.")
+            show_err(self, "Error", f"{model} model has no fixed dimensions.")
             return
 
         # --- Reset state ---
@@ -4010,34 +4103,48 @@ class XrayNapariWidget(QSplitter):
             if not db_folder_path:
                 return # User cancelled
 
+            self._open_default_dir = os.path.dirname(db_folder_path)
             db_files = [os.path.join(db_folder_path, f) for f in os.listdir(db_folder_path) if f.lower().endswith('.img')]
             if not db_files:
                 raise ValueError("No .IMG files found in the selected DB folder.")
 
+            self.progress_bar.setRange(0, len(db_files))
+            self.progress_bar.setValue(0)
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setFormat("Loading DB... %p%")
+            QApplication.processEvents()
+
             size_bytes = int(w) * int(h) * 2
-            db_stack = []
-            for fpath in db_files:
+            sum_img = np.zeros((int(h), int(w)), dtype=np.float64)
+            count = 0
+            for i, fpath in enumerate(db_files):
                 fsz = os.path.getsize(fpath)
-                header = fsz - size_bytes
-                if header < 0: continue
+                header = fsz - size_bytes 
+                if header < 0: continue 
                 with open(fpath, "rb") as fp:
                     fp.seek(header)
                     data = np.fromfile(fp, dtype=np.uint16, count=int(w) * int(h))
-                if data.size == int(w) * int(h):
-                    db_stack.append(data.reshape((int(h), int(w))))
+                if data.size == int(w) * int(h): 
+                    sum_img += data.reshape((int(h), int(w)))
+                    count += 1
+                if i % 10 == 0 or i == len(db_files) - 1:
+                    self.progress_bar.setValue(i + 1)
+                    QApplication.processEvents()
             
-            if not db_stack:
+            if count == 0:
                 raise ValueError("Could not load any valid .IMG files from the DB folder.")
 
-            db_avg_raw = np.mean(db_stack, axis=0).astype(np.float32)
+            self.progress_bar.setFormat("Averaging DB...")
+            QApplication.processEvents()
+            db_avg_raw = (sum_img / count).astype(np.float32)
             self.db_mean_1616dyn = float(np.mean(db_avg_raw))
             
             # --- 2. Load W Folder ---
             show_info(self, "Folder Selection", "W폴더를 선택해주세요")
-            dialog_dir = self._open_default_dir # Start from the same location
+            dialog_dir = self._open_default_dir
             w_folder_path = QFileDialog.getExistingDirectory(self, "2. Select W Folder", dialog_dir)
             w_avg_raw = None
-            if w_folder_path: # W folder is optional
+            if w_folder_path:
                 w_files = sorted([f for f in os.listdir(w_folder_path) if f.lower().startswith('w_')])
                 w_images_to_load = []
                 for fname in w_files:
@@ -4048,25 +4155,36 @@ class XrayNapariWidget(QSplitter):
                             w_images_to_load.append(os.path.join(w_folder_path, fname))
                 
                 if w_images_to_load:
-                    w_stack = []
-                    for fpath in w_images_to_load:
+                    self.progress_bar.setRange(0, len(w_images_to_load))
+                    self.progress_bar.setValue(0)
+                    self.progress_bar.setFormat("Loading W... %p%")
+                    QApplication.processEvents()
+
+                    sum_img_w = np.zeros((int(h), int(w)), dtype=np.float64)
+                    count_w = 0
+                    for i, fpath in enumerate(w_images_to_load):
                         fsz = os.path.getsize(fpath)
-                        header = fsz - size_bytes
-                        if header < 0: continue
+                        header = fsz - size_bytes 
+                        if header < 0: continue 
                         with open(fpath, "rb") as fp:
                             fp.seek(header)
                             data = np.fromfile(fp, dtype=np.uint16, count=int(w) * int(h))
-                        if data.size == int(w) * int(h):
-                            w_stack.append(data.reshape((int(h), int(w))))
-                    if w_stack:
-                        w_avg_raw = np.mean(w_stack, axis=0).astype(np.float32)
+                        if data.size == int(w) * int(h): 
+                            sum_img_w += data.reshape((int(h), int(w)))
+                            count_w += 1
+                        if i % 10 == 0 or i == len(w_images_to_load) - 1:
+                            self.progress_bar.setValue(i + 1)
+                            QApplication.processEvents()
+
+                    if count_w > 0:
+                        self.progress_bar.setFormat("Averaging W...")
+                        QApplication.processEvents()
+                        w_avg_raw = (sum_img_w / count_w).astype(np.float32)
                 self._open_default_dir = os.path.dirname(w_folder_path) or self._open_default_dir
 
             # --- Finalization (Show DB image) ---
             self._orig_w = int(w)
             self._orig_h = int(h)
-
-            # Apply orientation correction to both averages
             self.db_avg_1616dyn = np.ascontiguousarray(np.rot90(db_avg_raw, k=1)) if model in ORIENT_ROTATE_LEFT_FLIP_H_MODELS else db_avg_raw
             if model in ORIENT_ROTATE_LEFT_FLIP_H_MODELS:
                 self.db_avg_1616dyn = np.fliplr(self.db_avg_1616dyn)
@@ -4087,17 +4205,15 @@ class XrayNapariWidget(QSplitter):
                 model, img_w_px=self.width, img_h_px=self.height,
                 orig_w_px=self._orig_w, orig_h_px=self._orig_h
             )
-            self.loaded_file_path = db_folder_path # Use DB folder as primary path
+            self.loaded_file_path = db_folder_path
             self._fit_after_load = True
             self.blemish_save_dir = db_folder_path
-
             self._ensure_layers()
             self._clear_roi_and_blemish_layers()
             self._refresh_raw_layer()
             self._apply_fixed_roi_preset_on_load(model)
             self._apply_process_and_refresh()
             
-            # Calculate and store ROI means after ROI is set
             if self.roi_bounds and self.roi_bounds.valid:
                 roi = self.roi_bounds
                 if self.db_avg_1616dyn is not None:
@@ -4107,17 +4223,19 @@ class XrayNapariWidget(QSplitter):
 
             self.is_showing_1616dyn_db = True
             self._set_status(f"Loaded DB and W data. Press Blemish to proceed.")
-
         except Exception as e:
             self._open_default_dir = ""
             show_err(self, "Load Error", str(e))
+        finally:
+            self.progress_bar.setVisible(False)
+            self.progress_bar.setFormat("%p%")
 
     def _on_load_clicked(self) -> None:
         model = self.cb_model.currentText()
         typ = self.cb_type.currentText()
         
         # Special handler for 1616dyn
-        if model == "1616dyn":
+        if model in ("1616dyn", "1624dyn"):
             self._load_1616dyn_raw_folder()
             return
 
@@ -5040,7 +5158,7 @@ class XrayNapariWidget(QSplitter):
             return
 
         # For 1616dyn, switch from DB to W image on first detect press
-        if self.current_model == "1616dyn" and self.is_showing_1616dyn_db:
+        if self.current_model in ("1616dyn", "1624dyn") and self.is_showing_1616dyn_db:
             if self.w_avg_1616dyn is not None:
                 self.raw_data = self.w_avg_1616dyn
                 self._apply_process_and_refresh()
