@@ -30,12 +30,12 @@ jobs:
         run: |
           mkdir -p blender-ios/release/datafiles
           dd if=/dev/zero of=blender-ios/release/datafiles/startup.blend bs=1024 count=2 2>/dev/null
-          ICONDIR="blender-ios/release/ios/Blender.app/Assets.xcassets/AppIcon.appiconset"
-          ICON="$ICONDIR/blender_icon_1024x1024.png"
-          # macOS sips로 1024x1024 PNG 생성
-          python3 -c "open('$ICON','w').write('')"
-          # 1024x1024 solid color PNG
-          python3 -c $'import struct,zlib;w=h=64;r,g,b=0xF7,0x9E,0x2D\ndef c(t,d):return struct.pack(">I",len(d))+t+d+struct.pack(">I",zlib.crc32(t+d)&0xffffffff)\nraw=b""\nfor y in range(h):raw+=b"\\x00"+bytes([r,g,b,255])*w\nopen("$ICON","wb").write(b"\\x89PNG\\r\\n\\x1a\\n"+c(b"IHDR",struct.pack(">IIBBBBB",w,h,8,2,0,0,0))+c(b"IDAT",zlib.compress(raw))+c(b"IEND",b""))'
+          ICON="blender-ios/release/ios/Blender.app/Assets.xcassets/AppIcon.appiconset/blender_icon_1024x1024.png"
+          # PPM format -> sips convert to PNG
+          printf "P6\n1024 1024\n255\n" > /tmp/icon.ppm
+          # Generate 1024x1024 orange pixels (247,158,45)
+          python3 -c "import sys; sys.stdout.buffer.write(b'\\xf7\\x9e\\x2d'*1024*1024)" >> /tmp/icon.ppm
+          sips -s format png /tmp/icon.ppm --out "$ICON" 2>&1
           ls -la "$ICON"
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
