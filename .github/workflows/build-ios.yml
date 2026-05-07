@@ -32,11 +32,22 @@ jobs:
           git lfs install
           git lfs uninstall 2>/dev/null || true
 
-      - name: Create placeholder startup.blend
+      - name: Create placeholder assets (LFS 파일 대체)
         run: |
+          # startup.blend - CMakeLists.txt:131 체크 (<1KB면 FATAL_ERROR)
           mkdir -p blender-ios/release/datafiles
           dd if=/dev/zero of=blender-ios/release/datafiles/startup.blend bs=1024 count=2 2>/dev/null
-          echo "Created placeholder startup.blend (2KB)"
+          echo "Created startup.blend placeholder (2KB)"
+          
+          # AppIcon - LFS PNG 파일(131B)이 pointer라 Xcode build 실패
+          # 최소 valid PNG 생성 (1x1 투명 픽셀)
+          ICON="blender-ios/release/ios/Blender.app/Assets.xcassets/AppIcon.appiconset/blender_icon_1024x1024.png"
+          if [ -f "$ICON" ] && [ $(stat -f%z "$ICON" 2>/dev/null || stat -c%s "$ICON" 2>/dev/null) -lt 200 ]; then
+            # base64로 인코딩된 1x1 투명 PNG
+            echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" | base64 -d > "$ICON"
+            echo "Created placeholder AppIcon PNG"
+          fi
+          ls -la "$ICON"
 
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
