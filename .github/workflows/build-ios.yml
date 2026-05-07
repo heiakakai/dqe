@@ -1,5 +1,4 @@
 name: Build Blender iOS
-
 on:
   workflow_dispatch:
     inputs:
@@ -11,17 +10,14 @@ on:
         options:
           - unsigned
           - development
-
 env:
   CMAKE_BUILD_TYPE: Release
   BLENDER_REPO: salmazov/blender-ios
   BLENDER_BRANCH: ios-new
-
 jobs:
   build:
     runs-on: macos-latest
     timeout-minutes: 120
-
     steps:
       - name: Clone Blender iOS source
         run: |
@@ -30,59 +26,51 @@ jobs:
           cd blender-ios
           git lfs install
           git lfs uninstall 2>/dev/null || true
-
       - name: Create placeholder assets
         run: |
           mkdir -p blender-ios/release/datafiles
           dd if=/dev/zero of=blender-ios/release/datafiles/startup.blend bs=1024 count=2 2>/dev/null
-          echo "Created startup.blend placeholder (2KB)"
-          ICON="blender-ios/release/ios/Blender.app/Assets.xcassets/AppIcon.appiconset/blender_icon_1024x1024.png"
-          python3 -c "import struct,zlib;w,h=1024,1024;r,g,b=0xF7,0x9E,0x2D;exec('''\ndef c(t,d): return struct.pack(\">I\",len(d))+t+d+struct.pack(\">I\",zlib.crc32(t+d)&0xffffffff)\nraw=b\"\\x00\"+bytes([r,g,b,255])*w;raw=raw*h\nopen(\"'$ICON'\",\"wb\").write(b\"\\x89PNG\\r\\n\\x1a\\n\"+c(b\"IHDR\",struct.pack(\">IIBBBBB\",w,h,8,2,0,0,0))+c(b\"IDAT\",zlib.compress(raw))+c(b\"IEND\",b\"\"))\nprint(\"Created 1024x1024 AppIcon PNG\")''')"
+          ICONDIR="blender-ios/release/ios/Blender.app/Assets.xcassets/AppIcon.appiconset"
+          ICON="$ICONDIR/blender_icon_1024x1024.png"
+          # macOS sips로 1024x1024 PNG 생성
+          python3 -c "open('$ICON','w').write('')"
+          # 1024x1024 solid color PNG
+          python3 -c $'import struct,zlib;w=h=64;r,g,b=0xF7,0x9E,0x2D\ndef c(t,d):return struct.pack(">I",len(d))+t+d+struct.pack(">I",zlib.crc32(t+d)&0xffffffff)\nraw=b""\nfor y in range(h):raw+=b"\\x00"+bytes([r,g,b,255])*w\nopen("$ICON","wb").write(b"\\x89PNG\\r\\n\\x1a\\n"+c(b"IHDR",struct.pack(">IIBBBBB",w,h,8,2,0,0,0))+c(b"IDAT",zlib.compress(raw))+c(b"IEND",b""))'
           ls -la "$ICON"
-
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: '16'
-
       - name: Install dependencies
         run: |
           brew install cmake git-lfs
           git lfs install
-
       - name: Fetch prebuilt libraries
         run: |
           cd blender-ios
           export GIT_LFS_SKIP_SMUDGE=1
-          for lib in lib/ios_arm64 lib/macos_arm64; do
-            rm -rf $lib 2>/dev/null
-          done
+          rm -rf lib/ios_arm64 lib/macos_arm64 2>/dev/null
           git clone --depth 1 https://projects.blender.org/blender/lib-ios_arm64.git lib/ios_arm64
           git clone --depth 1 https://projects.blender.org/blender/lib-macos_arm64.git lib/macos_arm64
           for libdir in lib/ios_arm64 lib/macos_arm64; do
             cd $libdir && git lfs install && git lfs pull 2>&1 && cd ../..
           done
           du -sh lib/ios_arm64 lib/macos_arm64
-
       - name: Configure CMake
         run: |
           cd blender-ios && mkdir -p build_ios && cd build_ios
           IOS_SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           IOS_DEV_ROOT=$(dirname "$IOS_SDK_PATH")
           cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DWITH_APPLE_CROSSPLATFORM=ON -DAPPLE_TARGET_DEVICE=ios -DCMAKE_FIND_ROOT_PATH="$IOS_DEV_ROOT;$(dirname "$IOS_DEV_ROOT");$(pwd)/../lib/ios_arm64" -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED="NO" ..
-
       - name: Patch kernel.mm
         run: |
           cd blender-ios
           perl -pi -e 's/int\(\[mtlDevice maximumConcurrentCompilationTaskCount\]\)/((int)(long)([mtlDevice maximumConcurrentCompilationTaskCount]))/g' intern/cycles/device/metal/kernel.mm
-          grep -n "maximumConcurrentCompilationTask" intern/cycles/device/metal/kernel.mm
-
       - name: Build
         run: |
           cd blender-ios/build_ios
           set -o pipefail
           xcodebuild -project Blender.xcodeproj -scheme blender -configuration Release -sdk iphoneos -jobs $(sysctl -n hw.ncpu) CLANG_WARN_OBJC_METHOD_ACCESS=NO build 2>&1 | tail -80
-
       - name: Locate built app
         id: locate_app
         run: |
@@ -93,7 +81,6 @@ jobs:
           echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
           echo "Found app at: $APP_PATH"
           ls -la "$APP_PATH" 2>/dev/null || echo "APP NOT FOUND"
-
       - name: Create unsigned IPA
         if: ${{ github.event.inputs.signing == 'unsigned' }}
         run: |
@@ -107,7 +94,6 @@ jobs:
           fi
           zip -r Blender.ipa Payload/
           ls -lh Blender.ipa
-
       - name: Upload IPA as artifact
         uses: actions/upload-artifact@v4
         with:
@@ -115,7 +101,6 @@ jobs:
           path: Blender.ipa
           retention-days: 7
           if-no-files-found: error
-
       - name: Upload build logs (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
