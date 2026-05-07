@@ -23,15 +23,23 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Clone Blender iOS source (skip LFS smudge)
+      - name: Clone Blender iOS source
         run: |
-          # LFS 서버에 없는 에셋 파일이 있어 smudge 실패
-          # GIT_LFS_SKIP_SMUDGE=1로 클론 후 필요한 LFS만 선택적으로 pull
+          # LFS 서버에 브러시 에셋이 없어 smudge 실패 -> SKIP_SMUDGE로 클론
           export GIT_LFS_SKIP_SMUDGE=1
           git clone --depth 1 --branch ${{ env.BLENDER_BRANCH }} \
             https://github.com/${{ env.BLENDER_REPO }}.git blender-ios
           cd blender-ios
           git lfs install
+          # 메인 repo의 LFS는 .blend 파일 등 불필요하므로 uninstall
+          git lfs uninstall 2>/dev/null || true
+
+      - name: Create placeholder startup.blend
+        run: |
+          # CMakeLists.txt:131: startup.blend <1KB면 FATAL_ERROR
+          mkdir -p blender-ios/release/datafiles
+          dd if=/dev/zero of=blender-ios/release/datafiles/startup.blend bs=1024 count=2 2>/dev/null
+          echo "Created placeholder startup.blend (2KB)"
 
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
@@ -49,25 +57,25 @@ jobs:
           brew install cmake git-lfs
           git lfs install
 
-      - name: Restore essential LFS assets
+      - name: Fetch prebuilt libraries (from projects.blender.org)
         run: |
           cd blender-ios
-          # startup.blend는 CMake 필수 체크 대상이므로 반드시 받아야 함
-          git lfs pull --include="release/datafiles/startup.blend" 2>&1 || true
-          git lfs pull --include="*.h" --include="*.a" --include="*.dylib" 2>&1 || true
-          # 서브모듈에도 LFS가 있으면 복원
-          git submodule foreach --recursive "git lfs pull 2>&1 || true" 2>&1 || true
-
-      - name: Verify startup.blend
-        run: |
-          ls -la blender-ios/release/datafiles/startup.blend 2>/dev/null || echo "startup.blend not found"
-          # CMakeLists.txt에서 1KB 미만이면 FATAL_ERROR 발생하므로
-          # 파일이 없으면 임시 빈 파일 생성 (빌드 실패 방지)
-          if [ ! -f blender-ios/release/datafiles/startup.blend ]; then
-            mkdir -p blender-ios/release/datafiles
-            dd if=/dev/zero of=blender-ios/release/datafiles/startup.blend bs=1024 count=2 2>/dev/null
-            echo "Created placeholder startup.blend (2KB)"
-          fi
+          # 서브모듈은 projects.blender.org에 있음 (공식 Blender 라이브러리 저장소)
+          # LFS 활성화 상태에서 서브모듈 fetch (.a, .dylib 파일은 LFS 필요)
+          export GIT_LFS_SKIP_SMUDGE=1
+          git submodule update --init --depth 1 lib/ios_arm64 2>&1
+          git submodule update --init --depth 1 lib/macos_arm64 2>&1
+          # 서브모듈에서 LFS 실제 파일 pull
+          cd lib/ios_arm64
+          git lfs install
+          git lfs pull 2>&1
+          cd ../../lib/macos_arm64
+          git lfs install
+          git lfs pull 2>&1
+          cd ../..
+          echo "=== Library directories after LFS pull ==="
+          ls -la lib/ios_arm64/python/lib/ 2>/dev/null | head -5
+          find lib/ios_arm64 -name "*.a" 2>/dev/null | head -5
 
       - name: Fetch prebuilt libraries
         run: |
