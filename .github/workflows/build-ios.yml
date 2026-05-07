@@ -40,14 +40,31 @@ jobs:
           echo "Created startup.blend placeholder (2KB)"
           
           # AppIcon - LFS PNG 파일(131B)이 pointer라 Xcode build 실패
-          # 최소 valid PNG 생성 (1x1 투명 픽셀)
+          # Python으로 1024x1024 주황색 PNG 생성 (Blender 테마 색상)
           ICON="blender-ios/release/ios/Blender.app/Assets.xcassets/AppIcon.appiconset/blender_icon_1024x1024.png"
-          if [ -f "$ICON" ] && [ $(stat -f%z "$ICON" 2>/dev/null || stat -c%s "$ICON" 2>/dev/null) -lt 200 ]; then
-            # base64로 인코딩된 1x1 투명 PNG
-            echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" | base64 -d > "$ICON"
-            echo "Created placeholder AppIcon PNG"
-          fi
-          ls -la "$ICON"
+          python3 -c "
+import struct, zlib
+def create_png(width, height, r, g, b):
+    def chunk(chunk_type, data):
+        c = chunk_type + data
+        return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+    
+    raw = b''
+    for y in range(height):
+        raw += b'\\x00'  # filter byte
+        for x in range(width):
+            raw += bytes([r, g, b, 255])
+    
+    return b'\\x89PNG\\r\\n\\x1a\\n' + \
+        chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0)) + \
+        chunk(b'IDAT', zlib.compress(raw)) + \
+        chunk(b'IEND', b'')
+
+png = create_png(1024, 1024, 0xF7, 0x9E, 0x2D)  # Blender orange
+with open('$ICON', 'wb') as f:
+    f.write(png)
+print(f'Created 1024x1024 AppIcon PNG')
+"
 
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
