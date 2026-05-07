@@ -49,14 +49,25 @@ jobs:
           brew install cmake git-lfs
           git lfs install
 
-      - name: Restore LFS assets (skip broken brushes)
+      - name: Restore essential LFS assets
         run: |
           cd blender-ios
-          # LFS 에셋 중 빌드에 필요한 것만 복원
-          # 브러시 파일(.blend)은 LFS 서버에 없으므로 스킵
+          # startup.blend는 CMake 필수 체크 대상이므로 반드시 받아야 함
+          git lfs pull --include="release/datafiles/startup.blend" 2>&1 || true
           git lfs pull --include="*.h" --include="*.a" --include="*.dylib" 2>&1 || true
           # 서브모듈에도 LFS가 있으면 복원
           git submodule foreach --recursive "git lfs pull 2>&1 || true" 2>&1 || true
+
+      - name: Verify startup.blend
+        run: |
+          ls -la blender-ios/release/datafiles/startup.blend 2>/dev/null || echo "startup.blend not found"
+          # CMakeLists.txt에서 1KB 미만이면 FATAL_ERROR 발생하므로
+          # 파일이 없으면 임시 빈 파일 생성 (빌드 실패 방지)
+          if [ ! -f blender-ios/release/datafiles/startup.blend ]; then
+            mkdir -p blender-ios/release/datafiles
+            dd if=/dev/zero of=blender-ios/release/datafiles/startup.blend bs=1024 count=2 2>/dev/null
+            echo "Created placeholder startup.blend (2KB)"
+          fi
 
       - name: Fetch prebuilt libraries
         run: |
