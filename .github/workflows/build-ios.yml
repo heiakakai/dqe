@@ -25,18 +25,15 @@ jobs:
     steps:
       - name: Clone Blender iOS source
         run: |
-          # LFS 서버에 브러시 에셋이 없어 smudge 실패 -> SKIP_SMUDGE로 클론
           export GIT_LFS_SKIP_SMUDGE=1
           git clone --depth 1 --branch ${{ env.BLENDER_BRANCH }} \
             https://github.com/${{ env.BLENDER_REPO }}.git blender-ios
           cd blender-ios
           git lfs install
-          # 메인 repo의 LFS는 .blend 파일 등 불필요하므로 uninstall
           git lfs uninstall 2>/dev/null || true
 
       - name: Create placeholder startup.blend
         run: |
-          # CMakeLists.txt:131: startup.blend <1KB면 FATAL_ERROR
           mkdir -p blender-ios/release/datafiles
           dd if=/dev/zero of=blender-ios/release/datafiles/startup.blend bs=1024 count=2 2>/dev/null
           echo "Created placeholder startup.blend (2KB)"
@@ -46,12 +43,6 @@ jobs:
         with:
           xcode-version: '16'
 
-      - name: Verify Xcode & iOS SDK
-        run: |
-          xcode-select -p
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-path
-
       - name: Install dependencies
         run: |
           brew install cmake git-lfs
@@ -60,33 +51,20 @@ jobs:
       - name: Fetch prebuilt libraries (projects.blender.org, LFS)
         run: |
           cd blender-ios
-          # 서브모듈에 update = none 설정이 있어 git submodule update가 스킵됨
-          # 따라서 projects.blender.org에서 직접 클론
           export GIT_LFS_SKIP_SMUDGE=1
-          
-          if [ ! -d lib/ios_arm64/.git ]; then
-            rm -rf lib/ios_arm64 2>/dev/null
-            git clone --depth 1 https://projects.blender.org/blender/lib-ios_arm64.git lib/ios_arm64
-          fi
-          if [ ! -d lib/macos_arm64/.git ]; then
-            rm -rf lib/macos_arm64 2>/dev/null
-            git clone --depth 1 https://projects.blender.org/blender/lib-macos_arm64.git lib/macos_arm64
-          fi
-          
-          # 서브모듈에서 LFS 실제 파일 다운로드 (.a, .dylib 등)
+          for lib in lib/ios_arm64 lib/macos_arm64; do
+            rm -rf $lib 2>/dev/null
+          done
+          git clone --depth 1 https://projects.blender.org/blender/lib-ios_arm64.git lib/ios_arm64
+          git clone --depth 1 https://projects.blender.org/blender/lib-macos_arm64.git lib/macos_arm64
           for libdir in lib/ios_arm64 lib/macos_arm64; do
             cd $libdir
             git lfs install
             git lfs pull 2>&1
             cd ../..
           done
-          
-          echo "=== Library check ==="
-          find lib/ios_arm64 -name "*.a" 2>/dev/null | head -5
-          du -sh lib/ios_arm64 2>/dev/null
-          echo "---"
-          find lib/macos_arm64 -name "*.a" 2>/dev/null | head -5
-          du -sh lib/macos_arm64 2>/dev/null
+          echo "=== Library sizes ==="
+          du -sh lib/ios_arm64 lib/macos_arm64
 
       - name: Configure CMake
         run: |
@@ -105,18 +83,23 @@ jobs:
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED="NO" \
             ..
 
-      - name: Patch kernel.mm (pointer→int cast for iOS 18.5 SDK)
+      - name: Patch kernel.mm (fix id→int cast on iOS 18.5 SDK)
         run: |
-          # iOS 18.5 SDK에서 maximumConcurrentCompilationTaskCount는 NSInteger 반환
-          # Xcode 16.4의 iPhoneOS18.5 SDK에서 이 메서드가 없어 return type이 id(pointer)로 추론됨
-          # int(pointer)는 64→32bit narrowing 에러 발생
-          # C++ functional cast int(expr) 대신 C-style (int)expr로 변환
+          # maximumConcurrentCompilationTaskCount is unavailable in iOS 18.5 SDK
+          # so ObjC assumes 'id' return type → int(id) is illegal in C++
+          # Fix: forward-declare the method with proper NSInteger return type
           cd blender-ios
-          # C-style cast (int) 대신 int()를 (int)()로 변경
-          perl -pi -e 's/int\(\[mtlDevice maximumConcurrentCompilationTaskCount\]\)/(int)([mtlDevice maximumConcurrentCompilationTaskCount])/g' \
-            intern/cycles/device/metal/kernel.mm
-          echo "=== Patched lines ==="
-          grep -n "maximumConcurrentCompilationTaskCount" intern/cycles/device/metal/kernel.mm
+          cat > /tmp/metal_patch.h << 'EOF'
+          #if defined(__OBJC__)
+          @interface MTLDevice (MaxTasksPatch)
+          - (NSInteger)maximumConcurrentCompilationTaskCount;
+          @end
+          #endif
+          EOF
+          # Insert the forward decl before the first #import in kernel.mm
+          sed -i '' '1r /tmp/metal_patch.h' intern/cycles/device/metal/kernel.mm
+          echo "=== Patched ==="
+          head -10 intern/cycles/device/metal/kernel.mm
 
       - name: Build
         run: |
@@ -128,6 +111,7 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -jobs $(sysctl -n hw.ncpu) \
+            CLANG_WARN_OBJC_METHOD_ACCESS=NO \
             build 2>&1 | tail -80
 
       - name: Locate built app
@@ -149,7 +133,6 @@ jobs:
           if [ -d "$APP_PATH" ]; then
             cp -R "$APP_PATH" Payload/Blender.app
           else
-            # fallback
             find blender-ios/build_ios -name "*.app" -type d | head -3
             APP_PATH=$(find blender-ios/build_ios -name "*.app" -type d | head -1)
             cp -R "$APP_PATH" Payload/Blender.app 2>/dev/null || exit 1
