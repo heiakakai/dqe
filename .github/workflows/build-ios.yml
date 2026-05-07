@@ -105,11 +105,22 @@ jobs:
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED="NO" \
             ..
 
+      - name: Patch kernel.mm (pointer→int cast for iOS 18.5 SDK)
+        run: |
+          # iOS 18.5 SDK에서 maximumConcurrentCompilationTaskCount는 NSInteger 반환
+          # Xcode 16.4의 iPhoneOS18.5 SDK에서 이 메서드가 없어 return type이 id(pointer)로 추론됨
+          # int(pointer)는 64→32bit narrowing 에러 발생
+          # C++ functional cast int(expr) 대신 C-style (int)expr로 변환
+          cd blender-ios
+          # C-style cast (int) 대신 int()를 (int)()로 변경
+          perl -pi -e 's/int\(\[mtlDevice maximumConcurrentCompilationTaskCount\]\)/(int)([mtlDevice maximumConcurrentCompilationTaskCount])/g' \
+            intern/cycles/device/metal/kernel.mm
+          echo "=== Patched lines ==="
+          grep -n "maximumConcurrentCompilationTaskCount" intern/cycles/device/metal/kernel.mm
+
       - name: Build
         run: |
           cd blender-ios/build_ios
-          # kernel.mm: maximumConcurrentCompilationTaskCount is iOS 18+ only
-          # returns 'id' (pointer) on older SDK -> cast to int loses bits
           set -o pipefail
           xcodebuild \
             -project Blender.xcodeproj \
@@ -117,7 +128,6 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -jobs $(sysctl -n hw.ncpu) \
-            CLANG_WARN_OBJC_METHOD_ACCESS=NO \
             build 2>&1 | tail -80
 
       - name: Locate built app
