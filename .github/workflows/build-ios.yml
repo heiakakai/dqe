@@ -1,0 +1,130 @@
+name: Build Blender iOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      signing:
+        description: 'Signing method'
+        required: true
+        default: 'unsigned'
+        type: choice
+        options:
+          - unsigned
+          - development
+
+env:
+  CMAKE_BUILD_TYPE: Release
+  BLENDER_REPO: salmazov/blender-ios
+  BLENDER_BRANCH: ios-new
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Clone Blender iOS source
+        run: |
+          git clone --depth 1 --branch ${{ env.BLENDER_BRANCH }} \
+            https://github.com/${{ env.BLENDER_REPO }}.git blender-ios
+          cd blender-ios
+          git lfs install
+          git lfs pull
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16'
+
+      - name: Verify Xcode & iOS SDK
+        run: |
+          xcode-select -p
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Install dependencies
+        run: |
+          brew install cmake git-lfs
+          git lfs install
+
+      - name: Fetch prebuilt libraries
+        run: |
+          cd blender-ios
+          GIT_LFS_SKIP_SMUDGE=0 git submodule update --init --depth 1 lib/ios_arm64
+          GIT_LFS_SKIP_SMUDGE=0 git submodule update --init --depth 1 lib/macos_arm64
+
+      - name: Verify libraries
+        run: |
+          ls -la blender-ios/lib/ios_arm64/
+          find blender-ios/lib/ios_arm64/python/lib -name "*.a" 2>/dev/null | head -5
+
+      - name: Configure CMake
+        run: |
+          cd blender-ios
+          mkdir -p build_ios
+          cd build_ios
+          IOS_SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          IOS_DEV_ROOT=$(dirname "$IOS_SDK_PATH")
+          cmake -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DWITH_APPLE_CROSSPLATFORM=ON \
+            -DAPPLE_TARGET_DEVICE=ios \
+            -DCMAKE_FIND_ROOT_PATH="$IOS_DEV_ROOT;$(dirname "$IOS_DEV_ROOT");$(pwd)/../lib/ios_arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED="NO" \
+            ..
+
+      - name: Build
+        run: |
+          cd blender-ios/build_ios
+          xcodebuild \
+            -project Blender.xcodeproj \
+            -scheme blender \
+            -configuration Release \
+            -sdk iphoneos \
+            -jobs $(sysctl -n hw.ncpu) \
+            build 2>&1 | tail -80
+
+      - name: Locate built app
+        id: locate_app
+        run: |
+          APP_PATH=$(find blender-ios/build_ios -name "Blender.app" -type d -not -path "*/release/*" | head -1)
+          if [ -z "$APP_PATH" ]; then
+            APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -name "Blender.app" -type d | head -1)
+          fi
+          echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
+          echo "Found app at: $APP_PATH"
+          ls -la "$APP_PATH" 2>/dev/null || echo "APP NOT FOUND"
+
+      - name: Create unsigned IPA
+        if: ${{ github.event.inputs.signing == 'unsigned' }}
+        run: |
+          APP_PATH="${{ steps.locate_app.outputs.app_path }}"
+          mkdir -p Payload
+          if [ -d "$APP_PATH" ]; then
+            cp -R "$APP_PATH" Payload/Blender.app
+          else
+            # fallback
+            find blender-ios/build_ios -name "*.app" -type d | head -3
+            APP_PATH=$(find blender-ios/build_ios -name "*.app" -type d | head -1)
+            cp -R "$APP_PATH" Payload/Blender.app 2>/dev/null || exit 1
+          fi
+          zip -r Blender.ipa Payload/
+          ls -lh Blender.ipa
+
+      - name: Upload IPA as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Blender-iOS-${{ github.sha }}
+          path: Blender.ipa
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload build logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: blender-ios/build_ios/**/*.log
+          retention-days: 3
