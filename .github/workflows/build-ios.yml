@@ -26,45 +26,19 @@ jobs:
       - name: Clone Blender iOS source
         run: |
           export GIT_LFS_SKIP_SMUDGE=1
-          git clone --depth 1 --branch ${{ env.BLENDER_BRANCH }} \
-            https://github.com/${{ env.BLENDER_REPO }}.git blender-ios
+          git clone --depth 1 --branch ${{ env.BLENDER_BRANCH }} https://github.com/${{ env.BLENDER_REPO }}.git blender-ios
           cd blender-ios
           git lfs install
           git lfs uninstall 2>/dev/null || true
 
-      - name: Create placeholder assets (LFS 파일 대체)
+      - name: Create placeholder assets
         run: |
-          # startup.blend - CMakeLists.txt:131 체크 (<1KB면 FATAL_ERROR)
           mkdir -p blender-ios/release/datafiles
           dd if=/dev/zero of=blender-ios/release/datafiles/startup.blend bs=1024 count=2 2>/dev/null
           echo "Created startup.blend placeholder (2KB)"
-          
-          # AppIcon - LFS PNG 파일(131B)이 pointer라 Xcode build 실패
-          # Python으로 1024x1024 주황색 PNG 생성 (Blender 테마 색상)
           ICON="blender-ios/release/ios/Blender.app/Assets.xcassets/AppIcon.appiconset/blender_icon_1024x1024.png"
-          python3 -c "
-import struct, zlib
-def create_png(width, height, r, g, b):
-    def chunk(chunk_type, data):
-        c = chunk_type + data
-        return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
-    
-    raw = b''
-    for y in range(height):
-        raw += b'\\x00'  # filter byte
-        for x in range(width):
-            raw += bytes([r, g, b, 255])
-    
-    return b'\\x89PNG\\r\\n\\x1a\\n' + \
-        chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0)) + \
-        chunk(b'IDAT', zlib.compress(raw)) + \
-        chunk(b'IEND', b'')
-
-png = create_png(1024, 1024, 0xF7, 0x9E, 0x2D)  # Blender orange
-with open('$ICON', 'wb') as f:
-    f.write(png)
-print(f'Created 1024x1024 AppIcon PNG')
-"
+          python3 -c "import struct,zlib;w,h=1024,1024;r,g,b=0xF7,0x9E,0x2D;exec('''\ndef c(t,d): return struct.pack(\">I\",len(d))+t+d+struct.pack(\">I\",zlib.crc32(t+d)&0xffffffff)\nraw=b\"\\x00\"+bytes([r,g,b,255])*w;raw=raw*h\nopen(\"'$ICON'\",\"wb\").write(b\"\\x89PNG\\r\\n\\x1a\\n\"+c(b\"IHDR\",struct.pack(\">IIBBBBB\",w,h,8,2,0,0,0))+c(b\"IDAT\",zlib.compress(raw))+c(b\"IEND\",b\"\"))\nprint(\"Created 1024x1024 AppIcon PNG\")''')"
+          ls -la "$ICON"
 
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
@@ -76,7 +50,7 @@ print(f'Created 1024x1024 AppIcon PNG')
           brew install cmake git-lfs
           git lfs install
 
-      - name: Fetch prebuilt libraries (projects.blender.org, LFS)
+      - name: Fetch prebuilt libraries
         run: |
           cd blender-ios
           export GIT_LFS_SKIP_SMUDGE=1
@@ -86,57 +60,28 @@ print(f'Created 1024x1024 AppIcon PNG')
           git clone --depth 1 https://projects.blender.org/blender/lib-ios_arm64.git lib/ios_arm64
           git clone --depth 1 https://projects.blender.org/blender/lib-macos_arm64.git lib/macos_arm64
           for libdir in lib/ios_arm64 lib/macos_arm64; do
-            cd $libdir
-            git lfs install
-            git lfs pull 2>&1
-            cd ../..
+            cd $libdir && git lfs install && git lfs pull 2>&1 && cd ../..
           done
-          echo "=== Library sizes ==="
           du -sh lib/ios_arm64 lib/macos_arm64
 
       - name: Configure CMake
         run: |
-          cd blender-ios
-          mkdir -p build_ios
-          cd build_ios
+          cd blender-ios && mkdir -p build_ios && cd build_ios
           IOS_SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           IOS_DEV_ROOT=$(dirname "$IOS_SDK_PATH")
-          cmake -G Xcode \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DWITH_APPLE_CROSSPLATFORM=ON \
-            -DAPPLE_TARGET_DEVICE=ios \
-            -DCMAKE_FIND_ROOT_PATH="$IOS_DEV_ROOT;$(dirname "$IOS_DEV_ROOT");$(pwd)/../lib/ios_arm64" \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
-            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED="NO" \
-            ..
+          cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DWITH_APPLE_CROSSPLATFORM=ON -DAPPLE_TARGET_DEVICE=ios -DCMAKE_FIND_ROOT_PATH="$IOS_DEV_ROOT;$(dirname "$IOS_DEV_ROOT");$(pwd)/../lib/ios_arm64" -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED="NO" ..
 
-      - name: Patch kernel.mm (fix id→int cast on iOS 18.5 SDK)
+      - name: Patch kernel.mm
         run: |
-          # maximumConcurrentCompilationTaskCount is unavailable in iOS 18.5 SDK
-          # ObjC defaults return type to 'id'. In C++ mode, int(id) is ill-formed.
-          # Fix: replace int([obj selector]) with a helper that casts through intptr_t
           cd blender-ios
-          # Replace: 'int([mtlDevice maximumConcurrentCompilationTaskCount]) - 1'
-          # With:    '((int)(long)([mtlDevice maximumConcurrentCompilationTaskCount])) - 1'
-          # 'long' on arm64 is 64-bit = pointer-sized, safe intermediate type
-          perl -pi -e 's/int\(\[mtlDevice maximumConcurrentCompilationTaskCount\]\)/((int)(long)([mtlDevice maximumConcurrentCompilationTaskCount]))/g' \
-            intern/cycles/device/metal/kernel.mm
-          echo "=== Patched lines ==="
+          perl -pi -e 's/int\(\[mtlDevice maximumConcurrentCompilationTaskCount\]\)/((int)(long)([mtlDevice maximumConcurrentCompilationTaskCount]))/g' intern/cycles/device/metal/kernel.mm
           grep -n "maximumConcurrentCompilationTask" intern/cycles/device/metal/kernel.mm
 
       - name: Build
         run: |
           cd blender-ios/build_ios
           set -o pipefail
-          xcodebuild \
-            -project Blender.xcodeproj \
-            -scheme blender \
-            -configuration Release \
-            -sdk iphoneos \
-            -jobs $(sysctl -n hw.ncpu) \
-            CLANG_WARN_OBJC_METHOD_ACCESS=NO \
-            build 2>&1 | tail -80
+          xcodebuild -project Blender.xcodeproj -scheme blender -configuration Release -sdk iphoneos -jobs $(sysctl -n hw.ncpu) CLANG_WARN_OBJC_METHOD_ACCESS=NO build 2>&1 | tail -80
 
       - name: Locate built app
         id: locate_app
@@ -157,7 +102,6 @@ print(f'Created 1024x1024 AppIcon PNG')
           if [ -d "$APP_PATH" ]; then
             cp -R "$APP_PATH" Payload/Blender.app
           else
-            find blender-ios/build_ios -name "*.app" -type d | head -3
             APP_PATH=$(find blender-ios/build_ios -name "*.app" -type d | head -1)
             cp -R "$APP_PATH" Payload/Blender.app 2>/dev/null || exit 1
           fi
