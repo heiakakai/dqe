@@ -57,39 +57,36 @@ jobs:
           brew install cmake git-lfs
           git lfs install
 
-      - name: Fetch prebuilt libraries (from projects.blender.org)
+      - name: Fetch prebuilt libraries (projects.blender.org, LFS)
         run: |
           cd blender-ios
-          # 서브모듈은 projects.blender.org에 있음 (공식 Blender 라이브러리 저장소)
-          # LFS 활성화 상태에서 서브모듈 fetch (.a, .dylib 파일은 LFS 필요)
+          # 서브모듈에 update = none 설정이 있어 git submodule update가 스킵됨
+          # 따라서 projects.blender.org에서 직접 클론
           export GIT_LFS_SKIP_SMUDGE=1
-          git submodule update --init --depth 1 lib/ios_arm64 2>&1
-          git submodule update --init --depth 1 lib/macos_arm64 2>&1
-          # 서브모듈에서 LFS 실제 파일 pull
-          cd lib/ios_arm64
-          git lfs install
-          git lfs pull 2>&1
-          cd ../../lib/macos_arm64
-          git lfs install
-          git lfs pull 2>&1
-          cd ../..
-          echo "=== Library directories after LFS pull ==="
-          ls -la lib/ios_arm64/python/lib/ 2>/dev/null | head -5
+          
+          if [ ! -d lib/ios_arm64/.git ]; then
+            rm -rf lib/ios_arm64 2>/dev/null
+            git clone --depth 1 https://projects.blender.org/blender/lib-ios_arm64.git lib/ios_arm64
+          fi
+          if [ ! -d lib/macos_arm64/.git ]; then
+            rm -rf lib/macos_arm64 2>/dev/null
+            git clone --depth 1 https://projects.blender.org/blender/lib-macos_arm64.git lib/macos_arm64
+          fi
+          
+          # 서브모듈에서 LFS 실제 파일 다운로드 (.a, .dylib 등)
+          for libdir in lib/ios_arm64 lib/macos_arm64; do
+            cd $libdir
+            git lfs install
+            git lfs pull 2>&1
+            cd ../..
+          done
+          
+          echo "=== Library check ==="
           find lib/ios_arm64 -name "*.a" 2>/dev/null | head -5
-
-      - name: Fetch prebuilt libraries
-        run: |
-          cd blender-ios
-          export GIT_LFS_SKIP_SMUDGE=1
-          git submodule update --init --depth 1 lib/ios_arm64 2>&1 || true
-          git submodule update --init --depth 1 lib/macos_arm64 2>&1 || true
-          cd lib/ios_arm64 && git lfs pull 2>&1 || true
-          cd ../../lib/macos_arm64 && git lfs pull 2>&1 || true
-
-      - name: Verify libraries
-        run: |
-          ls -la blender-ios/lib/ios_arm64/
-          find blender-ios/lib/ios_arm64/python/lib -name "*.a" 2>/dev/null | head -5
+          du -sh lib/ios_arm64 2>/dev/null
+          echo "---"
+          find lib/macos_arm64 -name "*.a" 2>/dev/null | head -5
+          du -sh lib/macos_arm64 2>/dev/null
 
       - name: Configure CMake
         run: |
