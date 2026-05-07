@@ -86,20 +86,16 @@ jobs:
       - name: Patch kernel.mm (fix id→int cast on iOS 18.5 SDK)
         run: |
           # maximumConcurrentCompilationTaskCount is unavailable in iOS 18.5 SDK
-          # so ObjC assumes 'id' return type → int(id) is illegal in C++
-          # Fix: forward-declare the method with proper NSInteger return type
+          # ObjC defaults return type to 'id'. In C++ mode, int(id) is ill-formed.
+          # Fix: replace int([obj selector]) with a helper that casts through intptr_t
           cd blender-ios
-          cat > /tmp/metal_patch.h << 'EOF'
-          #if defined(__OBJC__)
-          @interface MTLDevice (MaxTasksPatch)
-          - (NSInteger)maximumConcurrentCompilationTaskCount;
-          @end
-          #endif
-          EOF
-          # Insert the forward decl before the first #import in kernel.mm
-          sed -i '' '1r /tmp/metal_patch.h' intern/cycles/device/metal/kernel.mm
-          echo "=== Patched ==="
-          head -10 intern/cycles/device/metal/kernel.mm
+          # Replace: 'int([mtlDevice maximumConcurrentCompilationTaskCount]) - 1'
+          # With:    '((int)(long)([mtlDevice maximumConcurrentCompilationTaskCount])) - 1'
+          # 'long' on arm64 is 64-bit = pointer-sized, safe intermediate type
+          perl -pi -e 's/int\(\[mtlDevice maximumConcurrentCompilationTaskCount\]\)/((int)(long)([mtlDevice maximumConcurrentCompilationTaskCount]))/g' \
+            intern/cycles/device/metal/kernel.mm
+          echo "=== Patched lines ==="
+          grep -n "maximumConcurrentCompilationTask" intern/cycles/device/metal/kernel.mm
 
       - name: Build
         run: |
