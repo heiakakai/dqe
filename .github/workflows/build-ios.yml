@@ -108,12 +108,16 @@ jobs:
       - name: Build
         run: |
           cd blender-ios/build_ios
+          # kernel.mm: maximumConcurrentCompilationTaskCount is iOS 18+ only
+          # returns 'id' (pointer) on older SDK -> cast to int loses bits
+          set -o pipefail
           xcodebuild \
             -project Blender.xcodeproj \
             -scheme blender \
             -configuration Release \
             -sdk iphoneos \
             -jobs $(sysctl -n hw.ncpu) \
+            CLANG_WARN_OBJC_METHOD_ACCESS=NO \
             build 2>&1 | tail -80
 
       - name: Locate built app
