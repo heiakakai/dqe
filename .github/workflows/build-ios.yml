@@ -23,13 +23,15 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Clone Blender iOS source
+      - name: Clone Blender iOS source (skip LFS smudge)
         run: |
+          # LFS 서버에 없는 에셋 파일이 있어 smudge 실패
+          # GIT_LFS_SKIP_SMUDGE=1로 클론 후 필요한 LFS만 선택적으로 pull
+          export GIT_LFS_SKIP_SMUDGE=1
           git clone --depth 1 --branch ${{ env.BLENDER_BRANCH }} \
             https://github.com/${{ env.BLENDER_REPO }}.git blender-ios
           cd blender-ios
           git lfs install
-          git lfs pull
 
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
@@ -47,11 +49,23 @@ jobs:
           brew install cmake git-lfs
           git lfs install
 
+      - name: Restore LFS assets (skip broken brushes)
+        run: |
+          cd blender-ios
+          # LFS 에셋 중 빌드에 필요한 것만 복원
+          # 브러시 파일(.blend)은 LFS 서버에 없으므로 스킵
+          git lfs pull --include="*.h" --include="*.a" --include="*.dylib" 2>&1 || true
+          # 서브모듈에도 LFS가 있으면 복원
+          git submodule foreach --recursive "git lfs pull 2>&1 || true" 2>&1 || true
+
       - name: Fetch prebuilt libraries
         run: |
           cd blender-ios
-          GIT_LFS_SKIP_SMUDGE=0 git submodule update --init --depth 1 lib/ios_arm64
-          GIT_LFS_SKIP_SMUDGE=0 git submodule update --init --depth 1 lib/macos_arm64
+          export GIT_LFS_SKIP_SMUDGE=1
+          git submodule update --init --depth 1 lib/ios_arm64 2>&1 || true
+          git submodule update --init --depth 1 lib/macos_arm64 2>&1 || true
+          cd lib/ios_arm64 && git lfs pull 2>&1 || true
+          cd ../../lib/macos_arm64 && git lfs pull 2>&1 || true
 
       - name: Verify libraries
         run: |
