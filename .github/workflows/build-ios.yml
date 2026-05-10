@@ -32,15 +32,98 @@ jobs:
           git lfs install
           git lfs uninstall 2>/dev/null || true
 
+      - name: Patch iOS source for maximum compatibility
+        run: |
+          ####################
+          # 1. CRASH FIX: Create LaunchScreen.storyboard
+          #    Without this, iOS loads UILaunchStoryboardName="LaunchScreen",
+          #    can't find the file, and crashes immediately (black screen -> exit).
+          ####################
+          cat > blender-ios/release/ios/Blender.app/LaunchScreen.storyboard << 'STORYBOARD_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <document type="com.apple.InterfaceBuilder3.CocoaTouch.Storyboard.XIB" version="3.0" toolsVersion="23505" targetRuntime="iOS.CocoaTouch" propertyAccessControl="none" useAutolayout="YES" launchScreen="YES" useTraitCollections="YES" colorMatched="YES" initialViewController="01J-lp-oVM">
+              <device id="ipad12_9rounded" orientation="landscape" layout="fullscreen" appearance="light"/>
+              <dependencies>
+                  <deployment version="5120" identifier="iOS"/>
+                  <plugIn identifier="com.apple.InterfaceBuilder.IBCocoaTouchPlugin" version="23505"/>
+                  <capability name="documents saved in the Xcode 8 format" minToolsVersion="8.0"/>
+              </dependencies>
+              <scenes>
+                  <scene sceneID="EHf-IW-A2E">
+                      <objects>
+                          <viewController id="01J-lp-oVM" sceneMemberID="viewController">
+                              <layoutGuides>
+                                  <viewControllerLayoutGuide type="top" id="fhr-nB-Yws"/>
+                                  <viewControllerLayoutGuide type="bottom" id="yjV-zp-cqy"/>
+                              </layoutGuides>
+                              <view key="view" contentMode="scaleToFill" id="Ze5-6b-2t3">
+                                  <rect key="frame" x="0.0" y="0.0" width="1366" height="1024"/>
+                                  <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
+                                  <color key="backgroundColor" red="0.15686" green="0.15686" blue="0.15686" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
+                              </view>
+                          </viewController>
+                          <placeholder placeholderIdentifier="IBFirstResponder" id="iYj-Kq-Ea1" userLabel="First Responder" sceneMemberID="firstResponder"/>
+                      </objects>
+                      <point key="canvasLocation" x="53" y="375"/>
+                  </scene>
+              </scenes>
+          </document>
+          STORYBOARD_EOF
+          echo "✓ Created LaunchScreen.storyboard"
+
+          ####################
+          # 2. Add LaunchScreen.storyboard to Xcode build via CMakeLists.txt
+          ####################
+          sed -i '' 's|set(storyboards ${OSX_APP_SOURCEDIR}/Main.storyboard)|set(storyboards ${OSX_APP_SOURCEDIR}/Main.storyboard ${OSX_APP_SOURCEDIR}/LaunchScreen.storyboard)|' \
+            blender-ios/source/creator/CMakeLists.txt
+          echo "✓ Patched CMakeLists.txt: added LaunchScreen.storyboard to build"
+
+          ####################
+          # 3. Remove deprecated UIRequiresFullScreen (iOS 26.0+ ignores it, Xcode warns)
+          ####################
+          python3 -c "
+          import plistlib
+          plist_path = 'blender-ios/release/ios/Blender.app/Info.plist'
+          with open(plist_path, 'rb') as f:
+              plist = plistlib.load(f)
+          plist.pop('UIRequiresFullScreen', None)
+          with open(plist_path, 'wb') as f:
+              plistlib.dump(plist, f)
+          print('✓ Removed UIRequiresFullScreen (deprecated in iOS 26.0+)')
+          "
+
+          ####################
+          # 4. Enable WITH_USD=ON for Universal Scene Description support
+          #    platform_apple.cmake forces this OFF with comment:
+          #    "Disable until we fix issue with release build"
+          #    We override this to try enabling USD import/export on iPad.
+          ####################
+          sed -i '' 's/set(WITH_USD OFF CACHE BOOL "Disable until we fix issue with release build" FORCE)/set(WITH_USD ON CACHE BOOL "Enabled for maximum compatibility" FORCE)/' \
+            blender-ios/build_files/cmake/platform/platform_apple.cmake
+          echo "✓ Enabled WITH_USD=ON (Universal Scene Description)"
+
+          ####################
+          # 5. Verify all patches applied correctly
+          ####################
+          echo ""
+          echo "=== Patch verification ==="
+          grep -q "LaunchScreen.storyboard" blender-ios/source/creator/CMakeLists.txt && echo "  ✓ CMakeLists.txt: LaunchScreen added" || echo "  ✗ CMakeLists.txt patch failed!"
+          python3 -c "
+          import plistlib
+          with open('blender-ios/release/ios/Blender.app/Info.plist', 'rb') as f:
+              plist = plistlib.load(f)
+          assert 'UIRequiresFullScreen' not in plist
+          print('  ✓ Info.plist: UIRequiresFullScreen removed')
+          "
+          grep 'WITH_USD ON' blender-ios/build_files/cmake/platform/platform_apple.cmake | grep 'FORCE' > /dev/null && echo "  ✓ platform_apple.cmake: WITH_USD=ON" || echo "  ✗ platform_apple.cmake patch failed!"
+
       - name: Download real startup.blend
         run: |
           mkdir -p blender-ios/release/datafiles
-          # Download the real startup.blend from GitHub Release (public URL, no auth needed)
           curl -sL "https://github.com/heiakakai/dqe/releases/download/startup-assets/startup.blend" \
             -o blender-ios/release/datafiles/startup.blend
           ls -la blender-ios/release/datafiles/startup.blend
           file blender-ios/release/datafiles/startup.blend
-          # Must be >1KB (Blender's CMake checks this)
           SIZE=$(wc -c < blender-ios/release/datafiles/startup.blend)
           echo "startup.blend size: $SIZE bytes"
           test "$SIZE" -gt 1024 || { echo "ERROR: startup.blend too small!"; exit 1; }
@@ -49,7 +132,6 @@ jobs:
         run: |
           ICON="blender-ios/release/ios/Blender.app/Assets.xcassets/AppIcon.appiconset/blender_icon_1024x1024.png"
           mkdir -p "$(dirname "$ICON")"
-          # Generate 1024x1024 orange PNG icon
           printf "P6\n1024 1024\n255\n" > /tmp/icon.ppm
           python3 -c "import sys; sys.stdout.buffer.write(b'\xf7\x9e\x2d'*1024*1024)" >> /tmp/icon.ppm
           sips -s format png /tmp/icon.ppm --out "$ICON" 2>&1
@@ -72,6 +154,51 @@ jobs:
           done
           du -sh lib/ios_arm64 lib/macos_arm64
 
+      - name: Pre-flight check
+        run: |
+          set -e
+          echo "=== Pre-flight validation ==="
+          fail=0
+
+          check() {
+            if [ -f "$1" ] || [ -d "$1" ]; then
+              echo "  ✓ $2"
+            else
+              echo "  ✗ $2 MISSING: $1"
+              fail=1
+            fi
+          }
+
+          check "blender-ios/release/ios/Blender.app/LaunchScreen.storyboard" "LaunchScreen.storyboard"
+          check "blender-ios/release/ios/Blender.app/Main.storyboard" "Main.storyboard"
+          check "blender-ios/release/ios/Blender.app/Info.plist" "Info.plist"
+          check "blender-ios/release/datafiles/startup.blend" "startup.blend"
+          check "blender-ios/lib/ios_arm64" "Prebuilt iOS libraries (lib/ios_arm64)"
+          check "blender-ios/lib/macos_arm64" "Prebuilt macOS libraries (lib/macos_arm64)"
+
+          # Verify CMakeLists.txt patch
+          grep -q "LaunchScreen.storyboard" blender-ios/source/creator/CMakeLists.txt || { echo "  ✗ CMakeLists.txt not patched!"; fail=1; }
+
+          # Verify Info.plist has no deprecated key
+          python3 -c "
+          import plistlib
+          with open('blender-ios/release/ios/Blender.app/Info.plist', 'rb') as f:
+              plist = plistlib.load(f)
+          assert 'UIRequiresFullScreen' not in plist, 'UIRequiresFullScreen still present!'
+          " && echo "  ✓ Info.plist clean (no deprecated keys)" || { echo "  ✗ Info.plist still has deprecated keys!"; fail=1; }
+
+          # Verify WITH_USD=ON patch
+          grep "WITH_USD ON" blender-ios/build_files/cmake/platform/platform_apple.cmake | grep "FORCE" > /dev/null && \
+            echo "  ✓ WITH_USD=ON enabled" || { echo "  ✗ WITH_USD patch failed!"; fail=1; }
+
+          if [ $fail -ne 0 ]; then
+            echo ""
+            echo "✗✗✗ PRE-FLIGHT FAILED ✗✗✗"
+            exit 1
+          fi
+          echo ""
+          echo "✓✓✓ ALL PRE-FLIGHT CHECKS PASSED ✓✓✓"
+
       - name: Configure CMake
         run: |
           cd blender-ios && mkdir -p build_ios && cd build_ios
@@ -85,7 +212,7 @@ jobs:
             -DCMAKE_FIND_ROOT_PATH="$IOS_DEV_ROOT;$(dirname "$IOS_DEV_ROOT");$(pwd)/../lib/ios_arm64" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED="NO" \
-            -DCMAKE_XCODE_ATTRIBUTE_METAL_ENABLE_DEBUG_INFO=YES \
+            -DCMAKE_XCODE_ATTRIBUTE_METAL_ENABLE_DEBUG_INFO=NO \
             ..
 
       - name: Patch kernel.mm
@@ -102,7 +229,7 @@ jobs:
             -sdk iphoneos \
             -jobs $(sysctl -n hw.ncpu) \
             CLANG_WARN_OBJC_METHOD_ACCESS=NO \
-            build 2>&1 | tail -50
+            build 2>&1 | tail -100
 
       - name: Locate built app
         id: locate_app
@@ -115,6 +242,20 @@ jobs:
           echo "Found app at: $APP_PATH"
           ls -la "$APP_PATH" 2>/dev/null || echo "APP NOT FOUND"
 
+          # Critical verification: LaunchScreen was compiled
+          if [ -d "$APP_PATH/LaunchScreen.storyboardc" ]; then
+            echo "✓ LaunchScreen.storyboardc EXISTS — crash fix confirmed"
+          else
+            echo "✗ WARNING: LaunchScreen.storyboardc MISSING — app will crash on launch!"
+          fi
+
+          # Check USD libraries linked
+          echo ""
+          echo "=== Linked libraries check ==="
+          if [ -f "$APP_PATH/Blender" ]; then
+            strings "$APP_PATH/Blender" | grep "libusd" | head -3 && echo "✓ USD linked" || echo "⚠ USD not detected (check CMake log)"
+          fi
+
       - name: Create unsigned IPA
         run: |
           APP_PATH="${{ steps.locate_app.outputs.app_path }}"
@@ -125,6 +266,10 @@ jobs:
             APP_PATH=$(find blender-ios/build_ios -name "*.app" -type d | head -1)
             cp -R "$APP_PATH" Payload/Blender.app 2>/dev/null || exit 1
           fi
+          echo "App bundle size:"
+          du -sh Payload/Blender.app
+          echo "Dylib count in Assets/lib:"
+          ls Payload/Blender.app/Assets/lib/*.dylib 2>/dev/null | wc -l
           zip -r Blender.ipa Payload/
           ls -lh Blender.ipa
 
