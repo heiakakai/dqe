@@ -35,11 +35,8 @@ jobs:
       - name: Download real startup.blend
         run: |
           mkdir -p blender-ios/release/datafiles
-          # Download the real startup.blend from our release assets
-          curl -sL \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/octet-stream" \
-            "https://api.github.com/repos/heiakakai/dqe/releases/assets/$(gh release view startup-assets --repo heiakakai/dqe --json assets -q '.assets[0].id')" \
+          # Download the real startup.blend from GitHub Release (public URL, no auth needed)
+          curl -sL "https://github.com/heiakakai/dqe/releases/download/startup-assets/startup.blend" \
             -o blender-ios/release/datafiles/startup.blend
           ls -la blender-ios/release/datafiles/startup.blend
           file blender-ios/release/datafiles/startup.blend
