@@ -1,4 +1,4 @@
-name: Build Blender iOS
+name: Build Blender iOS (Xcode 26.3)
 on:
   workflow_dispatch:
     inputs:
@@ -19,6 +19,11 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 120
     steps:
+      - name: Setup Xcode 26.3
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.3'
+
       - name: Clone Blender iOS source
         run: |
           export GIT_LFS_SKIP_SMUDGE=1
@@ -26,25 +31,38 @@ jobs:
           cd blender-ios
           git lfs install
           git lfs uninstall 2>/dev/null || true
-      - name: Create placeholder assets
+
+      - name: Download real startup.blend
         run: |
           mkdir -p blender-ios/release/datafiles
-          dd if=/dev/zero of=blender-ios/release/datafiles/startup.blend bs=1024 count=2 2>/dev/null
+          # Download the real startup.blend from our release assets
+          curl -sL \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            "https://api.github.com/repos/heiakakai/dqe/releases/assets/$(gh release view startup-assets --repo heiakakai/dqe --json assets -q '.assets[0].id')" \
+            -o blender-ios/release/datafiles/startup.blend
+          ls -la blender-ios/release/datafiles/startup.blend
+          file blender-ios/release/datafiles/startup.blend
+          # Must be >1KB (Blender's CMake checks this)
+          SIZE=$(wc -c < blender-ios/release/datafiles/startup.blend)
+          echo "startup.blend size: $SIZE bytes"
+          test "$SIZE" -gt 1024 || { echo "ERROR: startup.blend too small!"; exit 1; }
+
+      - name: Create AppIcon
+        run: |
           ICON="blender-ios/release/ios/Blender.app/Assets.xcassets/AppIcon.appiconset/blender_icon_1024x1024.png"
-          # PPM format -> sips convert to PNG
+          mkdir -p "$(dirname "$ICON")"
+          # Generate 1024x1024 orange PNG icon
           printf "P6\n1024 1024\n255\n" > /tmp/icon.ppm
-          # Generate 1024x1024 orange pixels (247,158,45)
-          python3 -c "import sys; sys.stdout.buffer.write(b'\\xf7\\x9e\\x2d'*1024*1024)" >> /tmp/icon.ppm
+          python3 -c "import sys; sys.stdout.buffer.write(b'\xf7\x9e\x2d'*1024*1024)" >> /tmp/icon.ppm
           sips -s format png /tmp/icon.ppm --out "$ICON" 2>&1
           ls -la "$ICON"
-      - name: Setup Xcode
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: '16'
+
       - name: Install dependencies
         run: |
           brew install cmake git-lfs
           git lfs install
+
       - name: Fetch prebuilt libraries
         run: |
           cd blender-ios
@@ -56,21 +74,45 @@ jobs:
             cd $libdir && git lfs install && git lfs pull 2>&1 && cd ../..
           done
           du -sh lib/ios_arm64 lib/macos_arm64
+
       - name: Configure CMake
         run: |
           cd blender-ios && mkdir -p build_ios && cd build_ios
           IOS_SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           IOS_DEV_ROOT=$(dirname "$IOS_SDK_PATH")
-          cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DWITH_APPLE_CROSSPLATFORM=ON -DAPPLE_TARGET_DEVICE=ios -DCMAKE_FIND_ROOT_PATH="$IOS_DEV_ROOT;$(dirname "$IOS_DEV_ROOT");$(pwd)/../lib/ios_arm64" -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED="NO" ..
+          cmake -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DWITH_APPLE_CROSSPLATFORM=ON \
+            -DAPPLE_TARGET_DEVICE=ios \
+            -DCMAKE_FIND_ROOT_PATH="$IOS_DEV_ROOT;$(dirname "$IOS_DEV_ROOT");$(pwd)/../lib/ios_arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED="NO" \
+            -DCMAKE_XCODE_ATTRIBUTE_METAL_ENABLE_DEBUG_INFO=YES \
+            ..
+
       - name: Patch kernel.mm
         run: |
           cd blender-ios
           perl -pi -e 's/int\(\[mtlDevice maximumConcurrentCompilationTaskCount\]\)/((int)(long)([mtlDevice maximumConcurrentCompilationTaskCount]))/g' intern/cycles/device/metal/kernel.mm
+
       - name: Build
+        env:
+          MTL_DEBUG_LAYER: 1
+          MTL_SHADER_VALIDATION: 1
+          MTL_DEBUG_LAYER_ERROR_MODE: skiptoolastool
         run: |
           cd blender-ios/build_ios
           set -o pipefail
-          xcodebuild -project Blender.xcodeproj -scheme blender -configuration Release -sdk iphoneos -jobs $(sysctl -n hw.ncpu) CLANG_WARN_OBJC_METHOD_ACCESS=NO build 2>&1 | tail -80
+          xcodebuild -project Blender.xcodeproj \
+            -scheme blender \
+            -configuration Release \
+            -sdk iphoneos \
+            -jobs $(sysctl -n hw.ncpu) \
+            IPHONEOS_DEPLOYMENT_TARGET=26.0 \
+            CLANG_WARN_OBJC_METHOD_ACCESS=NO \
+            build 2>&1 | tail -100
+
       - name: Locate built app
         id: locate_app
         run: |
@@ -81,8 +123,8 @@ jobs:
           echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
           echo "Found app at: $APP_PATH"
           ls -la "$APP_PATH" 2>/dev/null || echo "APP NOT FOUND"
+
       - name: Create unsigned IPA
-        if: ${{ github.event.inputs.signing == 'unsigned' }}
         run: |
           APP_PATH="${{ steps.locate_app.outputs.app_path }}"
           mkdir -p Payload
@@ -94,6 +136,7 @@ jobs:
           fi
           zip -r Blender.ipa Payload/
           ls -lh Blender.ipa
+
       - name: Upload IPA as artifact
         uses: actions/upload-artifact@v4
         with:
@@ -101,6 +144,7 @@ jobs:
           path: Blender.ipa
           retention-days: 7
           if-no-files-found: error
+
       - name: Upload build logs (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
