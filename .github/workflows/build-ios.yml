@@ -222,6 +222,7 @@ jobs:
 
       - name: Build
         run: |
+          set -o pipefail
           cd blender-ios/build_ios
           xcodebuild -project Blender.xcodeproj \
             -scheme blender \
