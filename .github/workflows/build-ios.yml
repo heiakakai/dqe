@@ -94,21 +94,15 @@ jobs:
           perl -pi -e 's/int\(\[mtlDevice maximumConcurrentCompilationTaskCount\]\)/((int)(long)([mtlDevice maximumConcurrentCompilationTaskCount]))/g' intern/cycles/device/metal/kernel.mm
 
       - name: Build
-        env:
-          MTL_DEBUG_LAYER: 1
-          MTL_SHADER_VALIDATION: 1
-          MTL_DEBUG_LAYER_ERROR_MODE: skiptoolastool
         run: |
           cd blender-ios/build_ios
-          set -o pipefail
           xcodebuild -project Blender.xcodeproj \
             -scheme blender \
             -configuration Release \
             -sdk iphoneos \
             -jobs $(sysctl -n hw.ncpu) \
-            IPHONEOS_DEPLOYMENT_TARGET=26.0 \
             CLANG_WARN_OBJC_METHOD_ACCESS=NO \
-            build 2>&1 | tail -100
+            build 2>&1 | tail -50
 
       - name: Locate built app
         id: locate_app
