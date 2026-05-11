@@ -35,9 +35,7 @@ jobs:
       - name: Patch iOS source for maximum compatibility
         run: |
           ####################
-          # 1. CRASH FIX: Create LaunchScreen.storyboard
-          #    Without this, iOS loads UILaunchStoryboardName="LaunchScreen",
-          #    can't find the file, and crashes immediately (black screen -> exit).
+          # 1. LaunchScreen.storyboard — prevents black screen crash on launch
           ####################
           cat > blender-ios/release/ios/Blender.app/LaunchScreen.storyboard << 'STORYBOARD_EOF'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -69,14 +67,14 @@ jobs:
               </scenes>
           </document>
           STORYBOARD_EOF
-          echo "✓ Created LaunchScreen.storyboard"
+          echo "[OK] LaunchScreen.storyboard created"
 
           ####################
-          # 2. Add LaunchScreen.storyboard to Xcode build via CMakeLists.txt
+          # 2. Add LaunchScreen.storyboard to Xcode build
           ####################
           sed -i '' 's|set(storyboards ${OSX_APP_SOURCEDIR}/Main.storyboard)|set(storyboards ${OSX_APP_SOURCEDIR}/Main.storyboard ${OSX_APP_SOURCEDIR}/LaunchScreen.storyboard)|' \
             blender-ios/source/creator/CMakeLists.txt
-          echo "✓ Patched CMakeLists.txt: added LaunchScreen.storyboard to build"
+          echo "[OK] CMakeLists.txt: LaunchScreen added to build"
 
           ####################
           # 3. Remove deprecated UIRequiresFullScreen (iOS 26.0+ ignores it, Xcode warns)
@@ -89,33 +87,40 @@ jobs:
           plist.pop('UIRequiresFullScreen', None)
           with open(plist_path, 'wb') as f:
               plistlib.dump(plist, f)
-          print('✓ Removed UIRequiresFullScreen (deprecated in iOS 26.0+)')
+          print('[OK] UIRequiresFullScreen removed')
           "
 
           ####################
-          # 4. Enable WITH_USD=ON for Universal Scene Description support
-          #    platform_apple.cmake forces this OFF with comment:
-          #    "Disable until we fix issue with release build"
-          #    We override this to try enabling USD import/export on iPad.
+          # 4. FORCE WITH_USD=OFF — USD headers are incomplete in prebuilt iOS libs
+          #    Original comment: "Disable until we fix issue with release build"
+          #    Enabling this causes: fatal error: 'pxr/usd/usdUI/accessibilityAPI.h' file not found
           ####################
-          sed -i '' 's/set(WITH_USD OFF CACHE BOOL "Disable until we fix issue with release build" FORCE)/set(WITH_USD ON CACHE BOOL "Enabled for maximum compatibility" FORCE)/' \
-            blender-ios/build_files/cmake/platform/platform_apple.cmake
-          echo "✓ Enabled WITH_USD=ON (Universal Scene Description)"
+          # Verify it stays OFF (default)
+          grep -q 'set(WITH_USD OFF' blender-ios/build_files/cmake/platform/platform_apple.cmake && \
+            echo "[OK] WITH_USD=OFF confirmed (USD headers not available in iOS prebuilt libs)" || \
+            echo "[WARN] WITH_USD override needed — applying fix..."
+          # Double-ensure OFF
+          sed -i '' 's/set(WITH_USD ON/set(WITH_USD OFF #FORCED_OFF_BY_FIX/g' \
+            blender-ios/build_files/cmake/platform/platform_apple.cmake 2>/dev/null || true
+          echo "[OK] WITH_USD lock: OFF (prevents accessibilityAPI.h build error)"
 
           ####################
-          # 5. Verify all patches applied correctly
+          # 5. Verify all patches
           ####################
           echo ""
           echo "=== Patch verification ==="
-          grep -q "LaunchScreen.storyboard" blender-ios/source/creator/CMakeLists.txt && echo "  ✓ CMakeLists.txt: LaunchScreen added" || echo "  ✗ CMakeLists.txt patch failed!"
+          ERR=0
+          grep -q "LaunchScreen.storyboard" blender-ios/source/creator/CMakeLists.txt && echo "  [OK] CMakeLists.txt: LaunchScreen" || { echo "  [FAIL] CMakeLists.txt patch!"; ERR=1; }
           python3 -c "
           import plistlib
           with open('blender-ios/release/ios/Blender.app/Info.plist', 'rb') as f:
               plist = plistlib.load(f)
           assert 'UIRequiresFullScreen' not in plist
-          print('  ✓ Info.plist: UIRequiresFullScreen removed')
-          "
-          grep 'WITH_USD ON' blender-ios/build_files/cmake/platform/platform_apple.cmake | grep 'FORCE' > /dev/null && echo "  ✓ platform_apple.cmake: WITH_USD=ON" || echo "  ✗ platform_apple.cmake patch failed!"
+          " && echo "  [OK] Info.plist: clean" || { echo "  [FAIL] Info.plist patch!"; ERR=1; }
+          grep "WITH_USD OFF" blender-ios/build_files/cmake/platform/platform_apple.cmake > /dev/null && \
+            echo "  [OK] WITH_USD=OFF" || { echo "  [FAIL] WITH_USD still ON!"; ERR=1; }
+          if [ $ERR -ne 0 ]; then echo "=== PATCH FAILED ==="; exit 1; fi
+          echo "[OK] All patches verified"
 
       - name: Download real startup.blend
         run: |
@@ -123,10 +128,10 @@ jobs:
           curl -sL "https://github.com/heiakakai/dqe/releases/download/startup-assets/startup.blend" \
             -o blender-ios/release/datafiles/startup.blend
           ls -la blender-ios/release/datafiles/startup.blend
-          file blender-ios/release/datafiles/startup.blend
           SIZE=$(wc -c < blender-ios/release/datafiles/startup.blend)
-          echo "startup.blend size: $SIZE bytes"
-          test "$SIZE" -gt 1024 || { echo "ERROR: startup.blend too small!"; exit 1; }
+          echo "startup.blend: $SIZE bytes"
+          test "$SIZE" -gt 1024 || { echo "FATAL: startup.blend too small!"; exit 1; }
+          echo "[OK] startup.blend: $SIZE bytes (valid)"
 
       - name: Create AppIcon
         run: |
@@ -135,12 +140,13 @@ jobs:
           printf "P6\n1024 1024\n255\n" > /tmp/icon.ppm
           python3 -c "import sys; sys.stdout.buffer.write(b'\xf7\x9e\x2d'*1024*1024)" >> /tmp/icon.ppm
           sips -s format png /tmp/icon.ppm --out "$ICON" 2>&1
-          ls -la "$ICON"
+          ls -la "$ICON" && echo "[OK] AppIcon created"
 
       - name: Install dependencies
         run: |
           brew install cmake git-lfs
           git lfs install
+          echo "[OK] deps installed"
 
       - name: Fetch prebuilt libraries
         run: |
@@ -152,54 +158,13 @@ jobs:
           for libdir in lib/ios_arm64 lib/macos_arm64; do
             cd $libdir && git lfs install && git lfs pull 2>&1 && cd ../..
           done
+          echo "[OK] Prebuilt libs:"
           du -sh lib/ios_arm64 lib/macos_arm64
 
-      - name: Pre-flight check
-        run: |
-          set -e
-          echo "=== Pre-flight validation ==="
-          fail=0
-
-          check() {
-            if [ -f "$1" ] || [ -d "$1" ]; then
-              echo "  ✓ $2"
-            else
-              echo "  ✗ $2 MISSING: $1"
-              fail=1
-            fi
-          }
-
-          check "blender-ios/release/ios/Blender.app/LaunchScreen.storyboard" "LaunchScreen.storyboard"
-          check "blender-ios/release/ios/Blender.app/Main.storyboard" "Main.storyboard"
-          check "blender-ios/release/ios/Blender.app/Info.plist" "Info.plist"
-          check "blender-ios/release/datafiles/startup.blend" "startup.blend"
-          check "blender-ios/lib/ios_arm64" "Prebuilt iOS libraries (lib/ios_arm64)"
-          check "blender-ios/lib/macos_arm64" "Prebuilt macOS libraries (lib/macos_arm64)"
-
-          # Verify CMakeLists.txt patch
-          grep -q "LaunchScreen.storyboard" blender-ios/source/creator/CMakeLists.txt || { echo "  ✗ CMakeLists.txt not patched!"; fail=1; }
-
-          # Verify Info.plist has no deprecated key
-          python3 -c "
-          import plistlib
-          with open('blender-ios/release/ios/Blender.app/Info.plist', 'rb') as f:
-              plist = plistlib.load(f)
-          assert 'UIRequiresFullScreen' not in plist, 'UIRequiresFullScreen still present!'
-          " && echo "  ✓ Info.plist clean (no deprecated keys)" || { echo "  ✗ Info.plist still has deprecated keys!"; fail=1; }
-
-          # Verify WITH_USD=ON patch
-          grep "WITH_USD ON" blender-ios/build_files/cmake/platform/platform_apple.cmake | grep "FORCE" > /dev/null && \
-            echo "  ✓ WITH_USD=ON enabled" || { echo "  ✗ WITH_USD patch failed!"; fail=1; }
-
-          if [ $fail -ne 0 ]; then
-            echo ""
-            echo "✗✗✗ PRE-FLIGHT FAILED ✗✗✗"
-            exit 1
-          fi
-          echo ""
-          echo "✓✓✓ ALL PRE-FLIGHT CHECKS PASSED ✓✓✓"
-
       - name: Configure CMake
+        env:
+          # NO MTL_DEBUG env vars — they cause build failures
+          CMAKE_SUPPRESS_DEVELOPER_WARNINGS: "YES"
         run: |
           cd blender-ios && mkdir -p build_ios && cd build_ios
           IOS_SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -213,14 +178,21 @@ jobs:
             -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED="NO" \
             -DCMAKE_XCODE_ATTRIBUTE_METAL_ENABLE_DEBUG_INFO=NO \
+            -DWITH_USD=OFF \
+            -DWITH_HYDRA=OFF \
+            -DWITH_OPENGL=OFF \
+            -DWITH_VULKAN_BACKEND=OFF \
             ..
+          echo "[OK] CMake configured"
 
-      - name: Patch kernel.mm
+      - name: Patch kernel.mm (pointer cast fix)
         run: |
           cd blender-ios
           perl -pi -e 's/int\(\[mtlDevice maximumConcurrentCompilationTaskCount\]\)/((int)(long)([mtlDevice maximumConcurrentCompilationTaskCount]))/g' intern/cycles/device/metal/kernel.mm
+          echo "[OK] kernel.mm patched"
 
-      - name: Build
+      - name: Build (tail last 100 lines + error capture)
+        id: build
         run: |
           set -o pipefail
           cd blender-ios/build_ios
@@ -229,8 +201,16 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -jobs $(sysctl -n hw.ncpu) \
+            IPHONEOS_DEPLOYMENT_TARGET=26.0 \
             CLANG_WARN_OBJC_METHOD_ACCESS=NO \
-            build 2>&1 | tail -100
+            build 2>&1 | tee /tmp/xcode-build.log | tail -100
+          echo "build_exit_code=0" >> $GITHUB_OUTPUT
+
+      - name: Show build errors (if any)
+        if: failure()
+        run: |
+          echo "=== BUILD ERRORS ==="
+          grep -E "error:|fatal|FAILED|BUILD FAILED" /tmp/xcode-build.log | head -20
 
       - name: Locate built app
         id: locate_app
@@ -240,39 +220,32 @@ jobs:
             APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -name "Blender.app" -type d | head -1)
           fi
           echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
-          echo "Found app at: $APP_PATH"
-          ls -la "$APP_PATH" 2>/dev/null || echo "APP NOT FOUND"
+          echo "Found: $APP_PATH"
+          ls -la "$APP_PATH" 2>/dev/null || { echo "APP NOT FOUND!"; exit 1; }
 
-          # Critical verification: LaunchScreen was compiled
+          # Verify LaunchScreen was compiled
           if [ -d "$APP_PATH/LaunchScreen.storyboardc" ]; then
-            echo "✓ LaunchScreen.storyboardc EXISTS — crash fix confirmed"
+            echo "[OK] LaunchScreen.storyboardc compiled — crash fix active"
           else
-            echo "✗ WARNING: LaunchScreen.storyboardc MISSING — app will crash on launch!"
+            echo "[WARN] LaunchScreen.storyboardc MISSING — may crash on launch"
           fi
 
-          # Check USD libraries linked
-          echo ""
-          echo "=== Linked libraries check ==="
+          # App binary size
           if [ -f "$APP_PATH/Blender" ]; then
-            strings "$APP_PATH/Blender" | grep "libusd" | head -3 && echo "✓ USD linked" || echo "⚠ USD not detected (check CMake log)"
+            echo "Binary size: $(du -sh "$APP_PATH/Blender" | cut -f1)"
           fi
 
       - name: Create unsigned IPA
         run: |
           APP_PATH="${{ steps.locate_app.outputs.app_path }}"
           mkdir -p Payload
-          if [ -d "$APP_PATH" ]; then
-            cp -R "$APP_PATH" Payload/Blender.app
-          else
-            APP_PATH=$(find blender-ios/build_ios -name "*.app" -type d | head -1)
-            cp -R "$APP_PATH" Payload/Blender.app 2>/dev/null || exit 1
-          fi
-          echo "App bundle size:"
-          du -sh Payload/Blender.app
-          echo "Dylib count in Assets/lib:"
-          ls Payload/Blender.app/Assets/lib/*.dylib 2>/dev/null | wc -l
-          zip -r Blender.ipa Payload/
+          cp -R "$APP_PATH" Payload/Blender.app
+          echo "App bundle: $(du -sh Payload/Blender.app | cut -f1)"
+          dylib_count=$(ls Payload/Blender.app/Assets/lib/*.dylib 2>/dev/null | wc -l | tr -d ' ')
+          echo "Bundled dylibs: $dylib_count"
+          zip -rq Blender.ipa Payload/
           ls -lh Blender.ipa
+          echo "[OK] IPA created"
 
       - name: Upload IPA as artifact
         uses: actions/upload-artifact@v4
@@ -286,6 +259,8 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs
-          path: blender-ios/build_ios/**/*.log
+          name: build-logs-debug
+          path: |
+            /tmp/xcode-build.log
+            blender-ios/build_ios/**/*.log
           retention-days: 3
